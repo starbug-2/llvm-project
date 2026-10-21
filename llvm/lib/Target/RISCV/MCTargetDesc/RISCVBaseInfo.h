@@ -480,6 +480,31 @@ enum FenceField {
 };
 }
 
+// Starbug 2 execute-packet predicate nibble (one per operation).
+// Bits [3:1] are creg. Bit [0] is z.
+// creg 0 and z 0 is unconditional. creg 1..7 names x9..x15.
+// z 0 tests nonzero, z 1 tests zero. creg 0 and z 1 is reserved.
+namespace RISCVSB2 {
+inline bool isValidPred(unsigned Imm) {
+  return Imm <= 15 && !(((Imm >> 1) == 0) && (Imm & 1));
+}
+
+inline unsigned predCreg(unsigned Imm) { return Imm >> 1; }
+
+inline bool predTestsZero(unsigned Imm) { return Imm & 1; }
+
+// 0 means unconditional. Otherwise the GPR number (9..15).
+inline unsigned predRegNum(unsigned Imm) {
+  unsigned Creg = predCreg(Imm);
+  return Creg == 0 ? 0 : 8 + Creg;
+}
+
+// RegNum is the architectural register number, 9..15.
+inline unsigned encodePred(unsigned RegNum, bool TestZero) {
+  return ((RegNum - 8) << 1) | (TestZero ? 1u : 0u);
+}
+} // namespace RISCVSB2
+
 // Describes the supported floating point rounding mode encodings.
 namespace RISCVFPRndMode {
 enum RoundingMode {

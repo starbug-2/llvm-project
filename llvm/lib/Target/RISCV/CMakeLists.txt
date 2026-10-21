@@ -64,6 +64,7 @@ add_llvm_target(RISCVCodeGen
   RISCVRedundantCopyElimination.cpp
   RISCVRegisterInfo.cpp
   RISCVSelectionDAGInfo.cpp
+  StarbugNarrowIV.cpp
   StarbugVLIWBundleLayout.cpp
   StarbugVLIWConfig.cpp
   StarbugVLIWPacketizer.cpp

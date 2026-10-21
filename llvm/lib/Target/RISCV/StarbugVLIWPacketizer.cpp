@@ -5,6 +5,7 @@
 #include "MCTargetDesc/RISCVBaseInfo.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/CodeGen/LivePhysRegs.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
@@ -37,7 +38,16 @@ static bool isPacketizableMI(const MachineInstr &MI) {
       MI.getOpcode() == TargetOpcode::BUNDLE)
     return false;
 
-  if (MI.isInlineAsm() || MI.isCall() || MI.isTerminator() || MI.isPseudo())
+  if (MI.isInlineAsm() || MI.isCall() || MI.isReturn() || MI.isPseudo())
+    return false;
+
+  // One conditional branch may sit in slot 0 with operations that do not use
+  // its result. The branch does not cancel those operations: the packet reads
+  // every source at the start of the cycle. A call, a return, or an
+  // unconditional branch stays out. The compare that produces the branch
+  // condition is an earlier cycle, because that write commits at the end of
+  // its own cycle.
+  if (MI.isTerminator() && !(MI.isBranch() && !MI.isBarrier()))
     return false;
 
   // Keep potentially stateful/ordered instructions serialized.
@@ -407,18 +417,100 @@ static bool arePacketMembersIndependent(ArrayRef<MachineInstr *> Members,
   return true;
 }
 
+static bool complementaryPredicates(unsigned A, unsigned B) {
+  if (A == 0 || B == 0)
+    return false;
+  return (A >> 1) == (B >> 1) && (A & 1) != (B & 1);
+}
+
+// True when the only packet hazard is a WAW and the two writers have
+// complementary predicates, so exactly one of them commits.
+static bool isComplementaryWaw(
+    const MachineInstr &Cand, ArrayRef<MachineInstr *> Packet,
+    const DenseSet<Register> &CandUses, const DenseSet<Register> &CandDefs,
+    const DenseMap<MachineInstr *, unsigned> &Preds,
+    const TargetRegisterInfo &TRI) {
+  const unsigned CandPred = Preds.lookup(&Cand);
+  if (!CandPred)
+    return false;
+  DenseSet<Register> PacketDefs;
+  for (const MachineInstr *PMI : Packet) {
+    DenseSet<Register> Uses, Defs;
+    collectRegAccesses(*PMI, Uses, Defs);
+    PacketDefs.insert(Defs.begin(), Defs.end());
+  }
+  for (Register Reg : CandUses)
+    if (overlapsAnyRegister(Reg, PacketDefs, TRI))
+      return false;
+  bool SawWaw = false;
+  for (const MachineInstr *PMI : Packet) {
+    DenseSet<Register> Uses, Defs;
+    collectRegAccesses(*PMI, Uses, Defs);
+    bool Overlap = false;
+    for (Register Reg : CandDefs)
+      if (overlapsAnyRegister(Reg, Defs, TRI))
+        Overlap = true;
+    if (!Overlap)
+      continue;
+    SawWaw = true;
+    if (!complementaryPredicates(
+            CandPred, Preds.lookup(const_cast<MachineInstr *>(PMI))))
+      return false;
+  }
+  return SawWaw;
+}
+
+// True when every dependence in the packet is a complementary WAW. RAW and
+// WAR still split the packet. A complementary pair may share a header: exactly
+// one predicate fires, so exactly one write commits.
+static bool anyRegOverlap(const DenseSet<Register> &A,
+                          const DenseSet<Register> &B,
+                          const TargetRegisterInfo &TRI) {
+  for (Register Reg : A)
+    if (overlapsAnyRegister(Reg, B, TRI))
+      return true;
+  return false;
+}
+
+static bool dependenciesAreComplementaryWaw(
+    ArrayRef<MachineInstr *> Members,
+    const DenseMap<MachineInstr *, unsigned> &Preds,
+    const TargetRegisterInfo &TRI) {
+  bool SawWaw = false;
+  for (unsigned I = 0; I < Members.size(); ++I) {
+    DenseSet<Register> IUses, IDefs;
+    collectRegAccesses(*Members[I], IUses, IDefs);
+    const unsigned PredI = Preds.lookup(Members[I]);
+    for (unsigned J = I + 1; J < Members.size(); ++J) {
+      DenseSet<Register> JUses, JDefs;
+      collectRegAccesses(*Members[J], JUses, JDefs);
+      if (anyRegOverlap(JUses, IDefs, TRI) || anyRegOverlap(IUses, JDefs, TRI))
+        return false;
+      if (anyRegOverlap(JDefs, IUses, TRI) || anyRegOverlap(IDefs, JUses, TRI))
+        return false;
+      if (!anyRegOverlap(JDefs, IDefs, TRI))
+        continue;
+      if (!complementaryPredicates(PredI, Preds.lookup(Members[J])))
+        return false;
+      SawWaw = true;
+    }
+  }
+  return SawWaw;
+}
+
 /// Final safety gate for a formed packet.
 ///
 /// STARBUG hardware trusts the HINT unconditionally: there is no interlock
 /// that detects a bundle whose members are actually dependent, so a bad hint
 /// is a silent wrong answer rather than a fault. This re-derives the facts
-/// from the *final* instruction sequence that will be emitted, independently
-/// of the scheduling heuristics that produced it. If anything fails we simply
-/// decline to emit the hint; the same instructions then execute scalar, which
-/// is always correct.
-static bool isPacketSafeToHint(MachineBasicBlock &MBB, MachineInstr &First,
-                               unsigned PacketSize, bool DebugTransparent,
-                               const TargetRegisterInfo &TRI) {
+/// from the final instruction sequence. A failed check leaves unconditional
+/// operations scalar. A predicated operation still needs its own header, which
+/// the caller emits; dropping that header would run it on the untaken path.
+/// Complementary predicates are the one WAW the header is allowed to keep.
+static bool isPacketSafeToHint(
+    MachineBasicBlock &MBB, MachineInstr &First, unsigned PacketSize,
+    bool DebugTransparent, const TargetRegisterInfo &TRI,
+    const DenseMap<MachineInstr *, unsigned> &Preds) {
   if (PacketSize == 0)
     return false;
 
@@ -471,8 +563,11 @@ static bool isPacketSafeToHint(MachineBasicBlock &MBB, MachineInstr &First,
       for (Register Reg : JUses)               // RAW: J reads what I writes
         if (overlapsAnyRegister(Reg, IDefs, TRI))
           return false;
-      for (Register Reg : JDefs)               // WAW: both write
-        if (overlapsAnyRegister(Reg, IDefs, TRI))
+      // Complementary predicates may write one register. Exactly one fires.
+      const bool ComplementaryWaw = complementaryPredicates(
+          Preds.lookup(Members[I]), Preds.lookup(Members[J]));
+      for (Register Reg : JDefs)
+        if (overlapsAnyRegister(Reg, IDefs, TRI) && !ComplementaryWaw)
           return false;
     }
   }
@@ -499,11 +594,208 @@ FunctionPass *llvm::createStarbugVLIWPacketizerPass() {
   return new StarbugVLIWPacketizer();
 }
 
+bool StarbugVLIWPacketizer::predicateBranches(MachineFunction &MF,
+                                              const RISCVSubtarget &ST) {
+  const auto *TII = ST.getInstrInfo();
+  const auto *TRI = ST.getRegisterInfo();
+  if (!TII || !TRI)
+    return false;
+
+  bool Changed = false;
+  for (MachineBasicBlock &BB : MF) {
+    if (BB.isEHPad() || BB.hasAddressTaken())
+      continue;
+
+    MachineBasicBlock *TBB = nullptr;
+    MachineBasicBlock *FBB = nullptr;
+    SmallVector<MachineOperand, 4> Cond;
+    if (TII->analyzeBranch(BB, TBB, FBB, Cond, /*AllowModify=*/false))
+      continue;
+    // Two terminators means the then-body is this block. Leave that shape
+    // for the predecessor, which sees it as the fallthrough.
+    if (FBB || Cond.size() != 3 || !TBB)
+      continue;
+    const unsigned Opc = Cond[0].getImm();
+    if (Opc != RISCV::BEQ && Opc != RISCV::BNE)
+      continue;
+    const Register RS1 = Cond[1].getReg();
+    const Register RS2 = Cond[2].getReg();
+    if (!RS1.isPhysical() || RS1 == RISCV::X0 || RS2 != RISCV::X0)
+      continue;
+
+    MachineBasicBlock *Then = BB.getFallThrough();
+    if (!Then || Then == TBB || Then->pred_size() != 1 || Then->isEHPad() ||
+        Then->hasAddressTaken())
+      continue;
+
+    MachineBasicBlock *ThenT = nullptr;
+    MachineBasicBlock *ThenF = nullptr;
+    SmallVector<MachineOperand, 4> ThenCond;
+    // analyzeBranch fails on a return. Both sides returning is still a
+    // diamond: the two bodies run under opposite predicates and one return
+    // is enough.
+    const bool ThenReturns = !Then->empty() && Then->back().isReturn() &&
+                             !Then->back().isCall();
+    if (TII->analyzeBranch(*Then, ThenT, ThenF, ThenCond,
+                           /*AllowModify=*/false)) {
+      if (!ThenReturns)
+        continue;
+    } else if (!ThenCond.empty() || ThenF) {
+      continue;
+    }
+
+    // If-then: Then lands on the block the branch skips.
+    // If-then-else: Then jumps to the join, or both sides return, and the
+    // branch target is the else block laid out immediately after Then.
+    MachineBasicBlock *Else = nullptr;
+    MachineBasicBlock *Join = nullptr;
+    const bool Diamond = (ThenT && ThenT != TBB) || ThenReturns;
+    if (!Diamond) {
+      if (!ThenT && Then->getFallThrough() != TBB)
+        continue;
+    } else {
+      Else = TBB;
+      Join = ThenT;
+      if (Else->pred_size() != 1 || Else->isEHPad() ||
+          Else->hasAddressTaken() || Then->getNextNode() != Else)
+        continue;
+      const bool ElseReturns = !Else->empty() && Else->back().isReturn() &&
+                               !Else->back().isCall();
+      if (ThenReturns && !ElseReturns)
+        continue;
+      MachineBasicBlock *ElseT = nullptr;
+      MachineBasicBlock *ElseF = nullptr;
+      SmallVector<MachineOperand, 4> ElseCond;
+      if (TII->analyzeBranch(*Else, ElseT, ElseF, ElseCond,
+                             /*AllowModify=*/false)) {
+        if (!ElseReturns)
+          continue;
+      } else if (!ElseCond.empty() || ElseF) {
+        continue;
+      }
+      if (!ElseReturns) {
+        if (ElseT && ElseT != Join)
+          continue;
+        if (!ElseT && Else->getFallThrough() != Join)
+          continue;
+      }
+    }
+
+    const unsigned ArchRS1 = RS1.id() - RISCV::X0;
+    const bool NeedCopy = ArchRS1 < 9 || ArchRS1 > 15;
+    Register Pred = RS1;
+    if (NeedCopy) {
+      LivePhysRegs Live(*TRI);
+      Live.addLiveOuts(BB);
+      Live.addLiveOuts(*Then);
+      if (Else)
+        Live.addLiveOuts(*Else);
+      auto NoteUses = [&](const MachineBasicBlock &Block) {
+        for (const MachineInstr &MI : Block)
+          for (const MachineOperand &MO : MI.operands())
+            if (MO.isReg() && MO.getReg().isPhysical())
+              Live.addReg(MO.getReg());
+      };
+      NoteUses(*Then);
+      if (Else)
+        NoteUses(*Else);
+      const MachineRegisterInfo &MRI = MF.getRegInfo();
+      Pred = Register();
+      for (unsigned R = RISCV::X9; R <= RISCV::X15; ++R) {
+        if (!Live.contains(R) && !MRI.isReserved(R)) {
+          Pred = Register(R);
+          break;
+        }
+      }
+      if (!Pred.isValid())
+        continue;
+    }
+
+    auto DefinesPred = [&](const MachineInstr &MI) {
+      for (const MachineOperand &MO : MI.operands())
+        if (MO.isReg() && MO.isDef() && MO.getReg().isPhysical() &&
+            TRI->regsOverlap(MO.getReg(), Pred))
+          return true;
+      return false;
+    };
+    auto CollectBody = [&](MachineBasicBlock &Block,
+                           SmallVectorImpl<MachineInstr *> &Body) {
+      for (MachineInstr &MI : Block) {
+        if (MI.isDebugInstr() || MI.isTerminator())
+          continue;
+        if (MI.isCall() || MI.isReturn() || MI.isInlineAsm() || MI.isPseudo() ||
+            MI.hasUnmodeledSideEffects() || DefinesPred(MI))
+          return false;
+        Body.push_back(&MI);
+        if (Body.size() > 4)
+          return false;
+      }
+      return true;
+    };
+
+    SmallVector<MachineInstr *, 4> ThenBody;
+    SmallVector<MachineInstr *, 4> ElseBody;
+    if (!CollectBody(*Then, ThenBody) || ThenBody.empty())
+      continue;
+    if (Else && !CollectBody(*Else, ElseBody))
+      continue;
+
+    // BEQ rs, x0 skips Then when rs is zero, so Then runs when rs is nonzero.
+    // BNE skips Then when rs is nonzero, so Then runs when rs is zero.
+    // The else side takes the opposite sense. The two nibbles name one
+    // register and therefore may write that register in one packet.
+    const bool ThenTestsZero = Opc == RISCV::BNE;
+    const unsigned Arch = Pred.id() - RISCV::X0;
+    if (Arch < 9 || Arch > 15)
+      continue;
+    const unsigned ThenNibble = RISCVSB2::encodePred(Arch, ThenTestsZero);
+    const unsigned ElseNibble = RISCVSB2::encodePred(Arch, !ThenTestsZero);
+    auto Attach = [&](MachineInstr *MI, unsigned Nibble) {
+      Predicates[MI] = Nibble;
+      MI->addOperand(MachineOperand::CreateReg(Pred, /*isDef=*/false,
+                                               /*isImp=*/true));
+      if (!MI->getParent()->isLiveIn(Pred))
+        MI->getParent()->addLiveIn(Pred);
+    };
+    for (MachineInstr *MI : ThenBody)
+      Attach(MI, ThenNibble);
+    for (MachineInstr *MI : ElseBody)
+      Attach(MI, ElseNibble);
+
+    if (NeedCopy) {
+      MachineInstr *Br = &*BB.getFirstTerminator();
+      BuildMI(BB, Br->getIterator(), Br->getDebugLoc(), TII->get(RISCV::ADDI),
+              Pred)
+          .addReg(RS1)
+          .addImm(0);
+    }
+    TII->removeBranch(BB);
+    BB.removeSuccessor(TBB);
+    if (Diamond) {
+      // Then's jump or return would skip the else body. Both bodies now run,
+      // and the predicates decide which writes commit.
+      if (ThenReturns) {
+        Then->back().eraseFromParent();
+      } else {
+        TII->removeBranch(*Then);
+        Then->removeSuccessor(Join);
+      }
+      if (!Then->isSuccessor(Else))
+        Then->addSuccessor(Else);
+    }
+    Changed = true;
+  }
+  return Changed;
+}
+
 bool StarbugVLIWPacketizer::runOnMachineFunction(MachineFunction &MF) {
   bool Changed = false;
   const auto &ST = MF.getSubtarget<RISCVSubtarget>();
   if (!ST.hasStarbugVLIW() || skipFunction(MF.getFunction()))
     return false;
+
+  Predicates.clear();
+  Changed |= predicateBranches(MF, ST);
 
   for (auto &MBB : MF)
     Changed |= packetizeBasicBlock(MBB, ST);
@@ -632,10 +924,26 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
     // ordering step below refuses to move anything in it. Everything else is
     // free to be permuted and must prove it.
     if (Packet.size() > 1 && !PacketHasAntiDep &&
-        !arePacketMembersIndependent(Packet, *TRI)) {
+        !arePacketMembersIndependent(Packet, *TRI) &&
+        !dependenciesAreComplementaryWaw(Packet, Predicates, *TRI)) {
       ++NumPacketsRejected;
       LLVM_DEBUG(dbgs() << "starbug: abandoning non-independent packet of size "
                         << Packet.size() << " in " << MBB.getName() << '\n');
+      // The members stay in program order. A predicated one still needs a
+      // header, or it executes on the untaken path.
+      for (MachineInstr *MI : Packet) {
+        const unsigned Pred = Predicates.lookup(MI);
+        if (!Pred)
+          continue;
+        BuildMI(MBB, MI->getIterator(), MI->getDebugLoc(),
+                TII->get(RISCV::STARBUG_BUNDLE_HINT))
+            .addImm(1)
+            .addImm(Pred)
+            .addImm(0)
+            .addImm(0)
+            .addImm(0);
+        Changed = true;
+      }
       abandonPacket();
       return;
     }
@@ -685,6 +993,15 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
       if (static_cast<int>(I) != MustBeFirst)
         PacketOrder.push_back(I);
 
+    // Hoisting a branch is only correct when the header is actually emitted.
+    // Without the header the branch is an ordinary control-flow instruction
+    // and must stay after the operations it used to follow.
+    const bool HoistedBranch =
+        MustBeFirst > 0 && Packet[MustBeFirst]->isBranch();
+    SmallVector<MachineInstr *, 8> BranchProgramOrder;
+    if (HoistedBranch)
+      BranchProgramOrder.assign(Packet.begin(), Packet.end());
+
     // Rebuild the region in lane order. InsertPos stays anchored on the first
     // not-yet-placed instruction: splicing a member in front of it fills the
     // slot immediately before InsertPos, so InsertPos must only advance when
@@ -725,6 +1042,10 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
     // isPacketSafeToHint re-derives both facts from the emitted sequence
     // below, so this only decides whether a bundle of this *size* is worth a
     // hint at all.
+    bool AnyPred = false;
+    for (MachineInstr *MI : Packet)
+      AnyPred |= Predicates.lookup(MI) != 0;
+
     bool ShouldEmitHint = false;
     if (IsFull)
       ShouldEmitHint = true;
@@ -732,23 +1053,65 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
       ShouldEmitHint = true;
     else if (IsSingle && Config.Scheduler.EmitSingleInstructionHints)
       ShouldEmitHint = true;
+    // A predicated operation is unconditional unless a header carries the
+    // predicate, including a packet of one.
+    if (AnyPred)
+      ShouldEmitHint = true;
 
-    // A hint is only ever a performance hint: declining to emit one costs
-    // parallelism but never correctness. Verify the real emitted sequence and
-    // stay scalar if it does not check out.
+    // Declining a header is safe only for unconditional operations. A
+    // predicated operation executes on the untaken path unless its nibble
+    // is on a header, so a rejected group is re-emitted as one header per
+    // predicated member. Verify the real emitted sequence first.
     if (ShouldEmitHint && PacketSize <= Config.maxBundleWidth()) {
       MachineInstr &First = *Packet.front();
       if (isPacketSafeToHint(MBB, First, PacketSize,
-                             Config.Scheduler.DebugInstrsTransparent, *TRI)) {
-        BuildMI(MBB, First, First.getDebugLoc(),
-                TII->get(RISCV::STARBUG_BUNDLE_HINT))
-            .addImm(static_cast<int64_t>(PacketSize));
+                             Config.Scheduler.DebugInstrsTransparent, *TRI,
+                             Predicates)) {
+        auto Hint = BuildMI(MBB, First, First.getDebugLoc(),
+                            TII->get(RISCV::STARBUG_BUNDLE_HINT))
+                        .addImm(static_cast<int64_t>(PacketSize));
+        for (unsigned Slot = 0; Slot < 4; ++Slot)
+          Hint.addImm(Slot < Packet.size() ? Predicates.lookup(Packet[Slot])
+                                           : 0);
         ++NumPacketsEmitted;
         Changed = true;
       } else {
         ++NumPacketsRejected;
         LLVM_DEBUG(dbgs() << "starbug: rejected unsafe packet of size "
                           << PacketSize << " in " << MBB.getName() << '\n');
+        if (HoistedBranch) {
+          auto RestorePos = Packet.front()->getIterator();
+          for (MachineInstr *MI : BranchProgramOrder) {
+            while (RestorePos != MBB.end() &&
+                   isTransparentMI(
+                       *RestorePos, Config.Scheduler.DebugInstrsTransparent))
+              ++RestorePos;
+            if (&*RestorePos == MI) {
+              ++RestorePos;
+              continue;
+            }
+            MBB.splice(RestorePos, &MBB, MI->getIterator());
+          }
+        }
+        // The group is not one packet. Each predicated operation still needs
+        // its own header, or it would execute on the untaken path.
+        const auto &Left = HoistedBranch
+                               ? BranchProgramOrder
+                               : static_cast<const SmallVector<MachineInstr *, 8> &>(
+                                     Packet);
+        for (MachineInstr *MI : Left) {
+          const unsigned Pred = Predicates.lookup(MI);
+          if (!Pred)
+            continue;
+          BuildMI(MBB, MI->getIterator(), MI->getDebugLoc(),
+                  TII->get(RISCV::STARBUG_BUNDLE_HINT))
+              .addImm(1)
+              .addImm(Pred)
+              .addImm(0)
+              .addImm(0)
+              .addImm(0);
+          Changed = true;
+        }
       }
     }
 
@@ -957,6 +1320,11 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
         break;
       if (isTransparentMI(*CandIt, Config.Scheduler.DebugInstrsTransparent))
         continue;
+      // A branch has to already be the next instruction. Pulling it forward
+      // over instructions that stay outside the packet would skip those
+      // instructions whenever the branch is taken.
+      if (CandIt->isBranch() && CandIt != MII)
+        continue;
       ++Seen;
 
       if (!canHoistCandidate(MII, CandIt,
@@ -971,7 +1339,9 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
 
       bool CandAntiDep = false;
       if (!Packet.empty()) {
-        if (hasPacketHazard(CandUses, CandDefs, PacketUses, PacketDefs, *TRI))
+        if (hasPacketHazard(CandUses, CandDefs, PacketUses, PacketDefs, *TRI) &&
+            !isComplementaryWaw(*CandIt, Packet, CandUses, CandDefs, Predicates,
+                                *TRI))
           continue;
         CandAntiDep = hasPacketAntiDependence(CandDefs, PacketUses, *TRI);
         // An anti-dependent member may join only if taking it changes nothing

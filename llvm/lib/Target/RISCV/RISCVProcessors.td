@@ -108,7 +108,7 @@ def GENERIC_RV64 : RISCVProcessorModel<"generic-rv64",
                                        GenericTuneFeatures>,
                    GenericTuneInfo;
 def STARBUG_VLIW : RISCVProcessorModel<"starbug-vliw",
-                                       NoSchedModel,
+                                       StarbugVLIWModel,
                                        [Feature32Bit,
                                         FeatureStdExtI,
                                         FeatureStdExtM,

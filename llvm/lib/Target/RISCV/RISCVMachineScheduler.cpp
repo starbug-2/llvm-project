@@ -72,6 +72,15 @@ bool RISCVPreRAMachineSchedStrategy::tryCandidate(SchedCandidate &Cand,
     return true;
   }
 
+  // An execute packet reads every source at the start of the cycle. Once the
+  // cycle has an operation, prefer another ready operation over a dependent
+  // one that would open a new cycle. Register pressure still breaks the tie
+  // between operations that can both issue now.
+  if (ST->hasStarbugVLIW() && Zone && Zone->getCurrMOps() > 0 &&
+      tryLess(Zone->getLatencyStallCycles(TryCand.SU),
+              Zone->getLatencyStallCycles(Cand.SU), TryCand, Cand, Stall))
+    return TryCand.Reason != NoCand;
+
   // Bias PhysReg Defs and copies to their uses and defined respectively.
   if (tryGreater(biasPhysReg(TryCand.SU, TryCand.AtTop),
                  biasPhysReg(Cand.SU, Cand.AtTop), TryCand, Cand, PhysReg))

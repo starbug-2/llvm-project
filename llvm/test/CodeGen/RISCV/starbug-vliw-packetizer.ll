@@ -1,19 +1,17 @@
-; Packetizer safety tests for the STARBUG VLIW extension.
+; Packetizer safety tests for the Starbug execute-packet header.
 ;
-; A STARBUG bundle hint (c.li zero, N) asserts that the next N instructions are
-; mutually independent and lane-legal. Hardware does not check this, so a wrong
-; hint is a silent wrong answer. These tests pin the two directions that matter:
-; a hint must appear where parallelism genuinely exists, and must not appear
-; where it does not.
+; sb2.header marks the following operations as one packet. Predicates in these
+; tests are unconditional. The parallel field is 7 for four operations, 6 for
+; three, and 4 for two. Hardware does not check independence, so a header is
+; emitted only for a group the packetizer has already proved safe.
 ;
 ; RUN: llc -mtriple=riscv32 -mcpu=starbug-vliw -mattr=+m,+c < %s | FileCheck %s
 
-; A strictly serial dependence chain has no independent pairs anywhere, so the
-; packetizer must not emit a hint. Before the scheduling fix this function was
-; one of the shapes that produced a bundle containing its own operands.
+; A strictly serial dependence chain has no independent pair, so it must not
+; get a header.
 define i32 @serial_chain(i32 %a, i32 %b) nounwind {
 ; CHECK-LABEL: serial_chain:
-; CHECK-NOT: c.li zero
+; CHECK-NOT: sb2.header
 ; CHECK: ret
   %t1 = add i32 %a, %b
   %t2 = mul i32 %t1, %a
@@ -23,12 +21,16 @@ define i32 @serial_chain(i32 %a, i32 %b) nounwind {
   ret i32 %t5
 }
 
-; Four mutually independent multiplies over disjoint operands: the packetizer
-; should find real parallelism here and emit at least one hint.
+; Four mutually independent multiplies. The pre-RA scheduler has four issue
+; slots and the packetizer should mark them as one unconditional packet.
 define i32 @independent_ops(i32 %a, i32 %b, i32 %c, i32 %d,
                             i32 %e, i32 %f, i32 %g, i32 %h) nounwind {
 ; CHECK-LABEL: independent_ops:
-; CHECK: c.li zero
+; CHECK: sb2.header un, un, un, un, 7
+; CHECK-NEXT: mul
+; CHECK-NEXT: mul
+; CHECK-NEXT: mul
+; CHECK-NEXT: mul
   %p1 = mul i32 %a, %b
   %p2 = mul i32 %c, %d
   %p3 = mul i32 %e, %f
@@ -39,15 +41,14 @@ define i32 @independent_ops(i32 %a, i32 %b, i32 %c, i32 %d,
   ret i32 %r
 }
 
-; A hint may never declare more than four instructions: ifu.sv forms a bundle
-; only for 1 <= imm <= 4 and ignores anything larger outright.
+; The machine has four slots. The printer's parallel field is only three bits,
+; and a packet of five operations is not a value it emits. 7 is four
+; operations, 6 is three, 4 is two.
 define void @bundle_width_cap(ptr %p, i32 %a, i32 %b, i32 %c, i32 %d,
                               i32 %e, i32 %f) nounwind {
 ; CHECK-LABEL: bundle_width_cap:
-; CHECK-NOT: c.li zero, 5
-; CHECK-NOT: c.li zero, 6
-; CHECK-NOT: c.li zero, 7
-; CHECK-NOT: c.li zero, 8
+; CHECK: sb2.header
+; CHECK-NOT: sb2.header un, un, un, un, 5
   %x1 = add i32 %a, %b
   %x2 = add i32 %c, %d
   %x3 = add i32 %e, %f
@@ -60,5 +61,38 @@ define void @bundle_width_cap(ptr %p, i32 %a, i32 %b, i32 %c, i32 %d,
   %z  = add i32 %y1, %y2
   %w  = add i32 %z, %y3
   store i32 %w, ptr %p
+  ret void
+}
+
+; A branch that tests x0 becomes a predicate. The then-body runs when the
+; source is nonzero, so the header names the register and does not test zero.
+define void @predicated_then(i32 %c, i32 %a, i32 %b, ptr %p) nounwind {
+; CHECK-LABEL: predicated_then:
+; CHECK: sb2.header {{!?[a-z][0-9]+}}, un, un, un, 0
+; CHECK-NOT: beq
+  %nz = icmp ne i32 %c, 0
+  br i1 %nz, label %then, label %join
+then:
+  store i32 %a, ptr %p
+  br label %join
+join:
+  ret void
+}
+
+; Both sides of a diamond become predicates on one register, opposite sense,
+; so the two stores may write the same address.
+define void @predicated_diamond(i32 %c, i32 %a, i32 %b, ptr %p) nounwind {
+; CHECK-LABEL: predicated_diamond:
+; CHECK: sb2.header {{[a-z][0-9]+}}, un, un, un, 0
+; CHECK: sb2.header !{{[a-z][0-9]+}}, un, un, un, 0
+  %nz = icmp ne i32 %c, 0
+  br i1 %nz, label %then, label %else
+then:
+  store i32 %a, ptr %p
+  br label %join
+else:
+  store i32 %b, ptr %p
+  br label %join
+join:
   ret void
 }

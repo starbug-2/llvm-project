@@ -1,14 +1,10 @@
 //===- StarbugVLIWBundleLayout.cpp - Fit bundles inside I-cache lines -----===//
 //
-// STARBUG's fetch unit builds a bundle out of the cache line it already has.
-// ifu.sv shifts the line down to the hint and then peels members off what is
-// left of it; the moment `bits_remaining` runs short it clears `bundle_ok`,
-// sets BundleBytesF back to 2 and lets the same instructions execute scalar.
-//
-// So a bundle that straddles an I-cache line is not merely slower -- it does
-// not exist. The core still fetches and retires the two-byte hint as a NOP,
-// then issues every member one per cycle. A four-wide bundle that straddles
-// costs five cycles instead of one.
+// Each execute packet is a 4-byte custom-0 header plus the operations that
+// follow it. This pass keeps that packet inside one 64-byte line. A packet
+// that would cross the line is split into smaller packets that fit. The
+// header is not a nop: splitting removes the straddling header and emits
+// headers for the pieces that remain.
 //
 // Nothing in the compiler could see this before: the packetizer runs on
 // MachineInstrs, where byte offsets do not exist yet, so hints landed wherever
@@ -63,9 +59,7 @@ STATISTIC(NumSlotsRecovered,
 
 static cl::opt<bool> StarbugVBundleLayout(
     "starbug-vliw-bundle-layout", cl::init(true), cl::Hidden,
-    cl::desc("Repack bundles that would straddle an I-cache line and be "
-             "declined by the fetch unit (ablation: false reproduces the "
-             "layout-blind behaviour)"));
+    cl::desc("Repack execute packets that would straddle an I-cache line"));
 
 static cl::opt<unsigned> StarbugVICacheLineBytes(
     "starbug-vliw-icache-line-bytes", cl::init(64), cl::Hidden,
@@ -118,7 +112,7 @@ struct Group {
 };
 
 /// Choose bundle boundaries for `Sizes` laid out from `Cursor`, so that every
-/// hinted group -- its two-byte hint included -- lies wholly inside one line.
+/// hinted group -- its four-byte header included -- lies wholly inside one line.
 ///
 /// Greedy, and greedy is right here: taking the widest group that fits now
 /// never costs more than one issue cycle later, because whatever is left
@@ -257,10 +251,21 @@ bool StarbugVLIWBundleLayout::repairFirstStraddle(
       ++Scan;
     }
 
+    const bool HasPred = [&]() {
+      for (unsigned P = 1; P < MI.getNumOperands() && P <= 4; ++P)
+        if (MI.getOperand(P).isImm() && MI.getOperand(P).getImm() != 0)
+          return true;
+      return false;
+    }();
+
     if (Members.size() != Len) {
-      // The hint outruns the block. The packetizer never emits this, but if
-      // it ever did the hardware would read whatever followed as a member, so
-      // drop the hint rather than leave it.
+      // A predicated header is the only thing keeping its operation off the
+      // untaken path. Leave it in place. An unconditional hint that outruns
+      // the block would make the hardware read whatever followed, so drop it.
+      if (HasPred) {
+        Offset += HintBytes;
+        continue;
+      }
       Offset += HintBytes;
       MI.eraseFromParent();
       ++NumHintsDropped;
@@ -294,8 +299,14 @@ bool StarbugVLIWBundleLayout::repairFirstStraddle(
     for (const Group &G : Groups)
       After += G.Hinted ? 1 : G.Count;
     if (After >= Before) {
-      // Repacking would not pay for itself. Drop the hint anyway: it buys
-      // nothing where it is and costs a fetched NOP every time through.
+      // Repacking would not pay for itself. An unconditional hint buys
+      // nothing here and costs a fetched NOP, so drop it. A predicated hint
+      // stays: dropping it would run the operation on the untaken path.
+      if (HasPred) {
+        Offset += Extent;
+        MII = std::prev(Scan);
+        continue;
+      }
       Offset += HintBytes;
       MI.eraseFromParent();
       ++NumHintsDropped;
@@ -312,15 +323,40 @@ bool StarbugVLIWBundleLayout::repairFirstStraddle(
       dbgs() << " (" << Before << " -> " << After << " issue cycles)\n";
     });
 
+    uint32_t Preds[4] = {0, 0, 0, 0};
+    for (unsigned P = 0; P < 4 && P + 1 < MI.getNumOperands(); ++P)
+      Preds[P] = static_cast<uint32_t>(MI.getOperand(P + 1).getImm());
+
     const DebugLoc DL = MI.getDebugLoc();
     MI.eraseFromParent();
     for (const Group &G : Groups) {
-      if (!G.Hinted)
+      if (G.Hinted) {
+        MachineInstr *FirstMember = Members[G.First];
+        auto Hint =
+            BuildMI(*FirstMember->getParent(), FirstMember->getIterator(), DL,
+                    TII.get(RISCV::STARBUG_BUNDLE_HINT))
+                .addImm(static_cast<int64_t>(G.Count));
+        for (unsigned P = 0; P < 4; ++P) {
+          const unsigned Src = G.First + P;
+          Hint.addImm(P < G.Count && Src < 4 ? Preds[Src] : 0);
+        }
         continue;
-      MachineInstr *FirstMember = Members[G.First];
-      BuildMI(*FirstMember->getParent(), FirstMember->getIterator(), DL,
-              TII.get(RISCV::STARBUG_BUNDLE_HINT))
-          .addImm(static_cast<int64_t>(G.Count));
+      }
+      // A member left scalar still has to carry its predicate. Without a
+      // header the operation executes on the untaken path.
+      for (unsigned P = 0; P < G.Count; ++P) {
+        const unsigned Src = G.First + P;
+        if (Src >= 4 || Preds[Src] == 0)
+          continue;
+        MachineInstr *Member = Members[Src];
+        BuildMI(*Member->getParent(), Member->getIterator(), DL,
+                TII.get(RISCV::STARBUG_BUNDLE_HINT))
+            .addImm(1)
+            .addImm(Preds[Src])
+            .addImm(0)
+            .addImm(0)
+            .addImm(0);
+      }
     }
 
     ++NumBundlesRepaired;
@@ -354,12 +390,8 @@ bool StarbugVLIWBundleLayout::runOnMachineFunction(MachineFunction &MF) {
     return false;
 
   const unsigned LineBytes = std::max(16u, StarbugVICacheLineBytes.getValue());
-  // The hint is the 16-bit C.LI x0 form; ifu.sv matches it before
-  // decompression, so a target without Zca cannot form bundles at all and
-  // there is nothing here to lay out.
-  if (!ST.hasStdExtZca())
-    return false;
-  const unsigned HintBytes = 2;
+  // sb2.header is a 32-bit custom-0 instruction.
+  const unsigned HintBytes = 4;
   const unsigned MaxWidth =
       std::min<unsigned>(4, RISCVVLIW::StarbugVLIWConfig::fromCommandLine()
                                 .maxBundleWidth());

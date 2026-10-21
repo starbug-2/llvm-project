@@ -107,6 +107,8 @@ FunctionPass *createStarbugVLIWTraceSchedulerPass();
 void initializeStarbugVLIWTraceSchedulerPass(PassRegistry &);
 FunctionPass *createStarbugVLIWBundleLayoutPass();
 void initializeStarbugVLIWBundleLayoutPass(PassRegistry &);
+FunctionPass *createStarbugNarrowIVPass();
+void initializeStarbugNarrowIVPass(PassRegistry &);
 
 FunctionPass *createRISCVPreAllocZilsdOptPass();
 void initializeRISCVPreAllocZilsdOptPass(PassRegistry &);

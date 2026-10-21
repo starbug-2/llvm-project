@@ -143,6 +143,29 @@ void RISCVInstPrinter::printCSRSystemRegister(const MCInst *MI, unsigned OpNo,
   markup(O, Markup::Register) << formatImm(Imm);
 }
 
+void RISCVInstPrinter::printSB2Pred(const MCInst *MI, unsigned OpNo,
+                                    const MCSubtargetInfo &STI,
+                                    raw_ostream &O) {
+  unsigned Imm = MI->getOperand(OpNo).getImm();
+  assert(RISCVSB2::isValidPred(Imm) && "Invalid Starbug predicate");
+  unsigned RegNum = RISCVSB2::predRegNum(Imm);
+  if (RegNum == 0) {
+    O << "un";
+    return;
+  }
+  if (RISCVSB2::predTestsZero(Imm))
+    O << '!';
+  markup(O, Markup::Register) << getRegisterName(RISCV::X0 + RegNum);
+}
+
+void RISCVInstPrinter::printSB2Parallel(const MCInst *MI, unsigned OpNo,
+                                        const MCSubtargetInfo &STI,
+                                        raw_ostream &O) {
+  // Always decimal. llvm-objdump prints other small immediates in hex, which
+  // would make the assembler and disassembler text differ.
+  O << MI->getOperand(OpNo).getImm();
+}
+
 void RISCVInstPrinter::printFenceArg(const MCInst *MI, unsigned OpNo,
                                      const MCSubtargetInfo &STI,
                                      raw_ostream &O) {

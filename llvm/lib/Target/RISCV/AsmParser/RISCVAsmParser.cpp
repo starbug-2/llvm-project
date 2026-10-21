@@ -215,6 +215,7 @@ class RISCVAsmParser : public MCTargetAsmParser {
   ParseStatus parseGPRPair(OperandVector &Operands, bool IsRV64Inst);
   ParseStatus parseFRMArg(OperandVector &Operands);
   ParseStatus parseFenceArg(OperandVector &Operands);
+  ParseStatus parseSB2Pred(OperandVector &Operands);
   ParseStatus parseRegList(OperandVector &Operands, bool MustIncludeS0 = false);
   ParseStatus parseRegListS0(OperandVector &Operands) {
     return parseRegList(Operands, /*MustIncludeS0=*/true);
@@ -641,6 +642,13 @@ public:
   /// Return true if the operand is a valid for the fence instruction e.g.
   /// ('iorw').
   bool isFenceArg() const { return Kind == KindTy::Fence; }
+
+  bool isSB2Pred() const {
+    int64_t Imm;
+    if (!isExpr() || !evaluateConstantExpr(getExpr(), Imm) || Imm < 0)
+      return false;
+    return RISCVSB2::isValidPred(static_cast<unsigned>(Imm));
+  }
 
   /// Return true if the operand is a valid floating point rounding mode.
   bool isFRMArg() const { return Kind == KindTy::FRM; }
@@ -2619,6 +2627,37 @@ ParseStatus RISCVAsmParser::parseFRMArg(OperandVector &Operands) {
 
   Operands.push_back(RISCVOperand::createFRMArg(FRM, getLoc()));
   Lex(); // Eat identifier token.
+  return ParseStatus::Success;
+}
+
+ParseStatus RISCVAsmParser::parseSB2Pred(OperandVector &Operands) {
+  bool TestZero = false;
+  SMLoc S = getLoc();
+  if (getLexer().is(AsmToken::Exclaim)) {
+    TestZero = true;
+    Lex();
+  }
+
+  if (getLexer().isNot(AsmToken::Identifier))
+    return TokError("operand must be 'un', x9-x15, or !x9-!x15");
+
+  StringRef Name = getLexer().getTok().getIdentifier();
+  SMLoc E = getTok().getEndLoc();
+  unsigned Imm = 0;
+  if (Name == "un") {
+    if (TestZero)
+      return TokError("unconditional predicate cannot test zero");
+  } else {
+    MCRegister Reg = matchRegisterNameHelper(Name);
+    unsigned RegNum = Reg.id();
+    if (!Reg || RegNum < RISCV::X9 || RegNum > RISCV::X15)
+      return TokError("predicate register must be x9-x15");
+    Imm = RISCVSB2::encodePred(RegNum - RISCV::X0, TestZero);
+  }
+
+  Lex();
+  Operands.push_back(RISCVOperand::createExpr(
+      MCConstantExpr::create(Imm, getContext()), S, E, isRV64()));
   return ParseStatus::Success;
 }
 

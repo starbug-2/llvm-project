@@ -277,6 +277,14 @@ static DecodeStatus decodeImmFourOperand(MCInst &Inst,
   return MCDisassembler::Success;
 }
 
+static DecodeStatus decodeSB2Pred(MCInst &Inst, uint32_t Imm, int64_t Address,
+                                  const MCDisassembler *Decoder) {
+  if (!RISCVSB2::isValidPred(Imm))
+    return MCDisassembler::Fail;
+  Inst.addOperand(MCOperand::createImm(Imm));
+  return MCDisassembler::Success;
+}
+
 template <unsigned N>
 static DecodeStatus decodeUImmOperand(MCInst &Inst, uint32_t Imm,
                                       int64_t Address,
@@ -531,6 +539,9 @@ static constexpr DecoderListEntry DecoderList32[]{
     {DecoderTableXAndes32, XAndesGroup, "Andes extensions"},
     {DecoderTableXSMT32, XSMTGroup, "SpacemiT extensions"},
     {DecoderTableXAIF32, XAIFGroup, "AI Foundry extensions"},
+    {DecoderTableStarbug32,
+     {RISCV::FeatureStarbugVLIW},
+     "Starbug execute-packet header"},
     // Standard Extensions
     {DecoderTable32, {}, "standard 32-bit instructions"},
     {DecoderTableRV32Only32, {}, "RV32-only standard 32-bit instructions"},

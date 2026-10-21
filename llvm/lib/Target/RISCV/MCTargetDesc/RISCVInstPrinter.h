@@ -38,6 +38,10 @@ public:
                               const MCSubtargetInfo &STI, raw_ostream &O);
   void printFenceArg(const MCInst *MI, unsigned OpNo,
                      const MCSubtargetInfo &STI, raw_ostream &O);
+  void printSB2Pred(const MCInst *MI, unsigned OpNo, const MCSubtargetInfo &STI,
+                    raw_ostream &O);
+  void printSB2Parallel(const MCInst *MI, unsigned OpNo,
+                        const MCSubtargetInfo &STI, raw_ostream &O);
   void printFRMArg(const MCInst *MI, unsigned OpNo, const MCSubtargetInfo &STI,
                    raw_ostream &O);
   void printFRMArgLegacy(const MCInst *MI, unsigned OpNo,

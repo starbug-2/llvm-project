@@ -106,7 +106,7 @@ static cl::opt<bool>
 
 static cl::opt<bool> EnableStarbugMachinePipeliner(
     "starbug-vliw-enable-machine-pipeliner", cl::Hidden,
-    cl::desc("Enable Machine Pipeliner by default for Starbug VLIW"),
+    cl::desc("Enable the Machine Pipeliner for Starbug VLIW"),
     cl::init(true));
 
 static cl::opt<bool> EnableStarbugTraceScheduler(
@@ -160,6 +160,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeRISCVTarget() {
   initializeStarbugVLIWPacketizerPass(*PR);
   initializeStarbugVLIWTraceSchedulerPass(*PR);
   initializeStarbugVLIWBundleLayoutPass(*PR);
+  initializeStarbugNarrowIVPass(*PR);
   initializeRISCVPreAllocZilsdOptPass(*PR);
   initializeRISCVExpandAtomicPseudoPass(*PR);
   initializeRISCVRedundantCopyEliminationPass(*PR);
@@ -482,6 +483,12 @@ bool RISCVPassConfig::addRegAssignAndRewriteOptimized() {
 }
 
 void RISCVPassConfig::addIRPasses() {
+  // A 64-bit trip count becomes several branches on RV32 and blocks the
+  // single-block pipeliner. Narrow the hot copy when the count fits in 32 bits.
+  if (getOptLevel() != CodeGenOptLevel::None &&
+      getRISCVTargetMachine().getTargetCPU() == "starbug-vliw")
+    addPass(createStarbugNarrowIVPass());
+
   addPass(createAtomicExpandLegacyPass());
   addPass(createRISCVZacasABIFixPass());
 

@@ -1797,6 +1797,9 @@ def FeatureExactAssembly
 def FeatureStarbugVLIW
     : SubtargetFeature<"starbug-vliw", "HasStarbugVLIW", "true",
                        "Enable Starbug VLIW packetization and ILP-first tuning">;
+def HasStarbugVLIW : Predicate<"Subtarget->hasStarbugVLIW()">,
+                     AssemblerPredicate<(all_of FeatureStarbugVLIW),
+                         "'starbug-vliw' (Starbug execute-packet header)">;
 
 foreach i = {1-31} in
   def FeatureReserveX#i :
