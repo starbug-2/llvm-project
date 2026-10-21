@@ -1,0 +1,15 @@
+# RUN: not llc -mtriple=amdgpu9 -run-pass=dead-mi-elimination -filetype=null %s 2>&1 | FileCheck %s
+
+# CHECK: MachineFunctionProperties required by Remove dead machine instructions pass are not met by function func.
+# CHECK-NEXT: Required properties: IsSSA
+# CHECK-NEXT: Current properties: NoPHIs
+# CHECK-NEXT: LLVM ERROR: MachineFunctionProperties check failed
+---
+name: func
+isSSA: false
+body:             |
+  bb.0:
+    %0:sgpr_32 = S_MOV_B32 0
+    %0:sgpr_32 = S_MOV_B32 0
+
+...
