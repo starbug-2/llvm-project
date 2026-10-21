@@ -12239,15 +12239,28 @@ bool ScalarEvolution::isImpliedCondBalancedTypes(
     return CmpInst::isRelational(P2) &&
            P1 == ICmpInst::getFlippedSignednessPredicate(P2);
   };
-  if (IsSignFlippedPredicate(Pred, FoundPred)) {
+  // If swapping query's operands makes the predicates sign-flipped, do it. E.g.
+  // the query "x >s -1" becomes "-1 <s x" for the found condition "x <u y".
+  CmpPredicate SignFlippedPred = Pred;
+  const SCEV *SignFlippedLHS = LHS, *SignFlippedRHS = RHS;
+  bool IsSwapped = false;
+  if (!IsSignFlippedPredicate(Pred, FoundPred) &&
+      IsSignFlippedPredicate(ICmpInst::getSwappedCmpPredicate(Pred),
+                             FoundPred)) {
+    SignFlippedPred = ICmpInst::getSwappedCmpPredicate(Pred);
+    std::swap(SignFlippedLHS, SignFlippedRHS);
+    IsSwapped = true;
+  }
+  if (IsSignFlippedPredicate(SignFlippedPred, FoundPred)) {
     // Unsigned comparison is the same as signed comparison when both the
     // operands are non-negative or negative.
-    if (haveSameSign(FoundLHS, FoundRHS))
+    if (!IsSwapped && haveSameSign(FoundLHS, FoundRHS))
       return isImpliedCondOperands(Pred, LHS, RHS, FoundLHS, FoundRHS, CtxI);
     // Create local copies that we can freely swap and canonicalize our
     // conditions to "le/lt".
-    CmpPredicate CanonicalPred = Pred, CanonicalFoundPred = FoundPred;
-    const SCEV *CanonicalLHS = LHS, *CanonicalRHS = RHS,
+    CmpPredicate CanonicalPred = SignFlippedPred,
+                 CanonicalFoundPred = FoundPred;
+    const SCEV *CanonicalLHS = SignFlippedLHS, *CanonicalRHS = SignFlippedRHS,
                *CanonicalFoundLHS = FoundLHS, *CanonicalFoundRHS = FoundRHS;
     if (ICmpInst::isGT(CanonicalPred) || ICmpInst::isGE(CanonicalPred)) {
       CanonicalPred = ICmpInst::getSwappedCmpPredicate(CanonicalPred);
@@ -12260,14 +12273,41 @@ bool ScalarEvolution::isImpliedCondBalancedTypes(
     assert((ICmpInst::isLT(CanonicalFoundPred) ||
             ICmpInst::isLE(CanonicalFoundPred)) &&
            "Must be!");
-    if (ICmpInst::isSigned(CanonicalPred) && isKnownNonNegative(CanonicalRHS))
+    if (ICmpInst::isSigned(CanonicalPred)) {
+      // Use implication:
+      // x <u y && y <=u 2^(n-1) --> x >=s 0,
+      // x <=u y && y <u 2^(n-1) --> x >=s 0,
+      // where n is the bit width of x and y.
+      // In both cases x <u 2^(n-1), so x >=s 0.
+      // y <=u 2^(n-1) means y >=s 0 or y == INT_MIN.
+      // If the implication's left part holds, try proving the query from x >=s
+      // 0.
+      Type *Ty = CanonicalFoundLHS->getType();
+      unsigned BitWidth = getTypeSizeInBits(Ty);
+      const SCEV *SignedMin = getConstant(APInt::getSignedMinValue(BitWidth));
+      CmpPredicate BoundPred = ICmpInst::isLT(CanonicalFoundPred)
+                                   ? ICmpInst::ICMP_ULE
+                                   : ICmpInst::ICMP_ULT;
+      if (isKnownViaNonRecursiveReasoning(BoundPred, CanonicalFoundRHS,
+                                          SignedMin)) {
+        // x >=s 0, written as 0 <=s x, or as -1 <s x to match a strict query.
+        const SCEV *Bound =
+            ICmpInst::isLE(CanonicalPred) ? getZero(Ty) : getMinusOne(Ty);
+        if (isImpliedCondOperands(CanonicalPred, CanonicalLHS, CanonicalRHS,
+                                  Bound, CanonicalFoundLHS, CtxI))
+          return true;
+      }
+    }
+    if (!IsSwapped && ICmpInst::isSigned(CanonicalPred) &&
+        isKnownNonNegative(CanonicalRHS))
       // Use implication:
       // x <u y && y >=s 0 --> x <s y.
       // If we can prove the left part, the right part is also proven.
       return isImpliedCondOperands(CanonicalFoundPred, CanonicalLHS,
                                    CanonicalRHS, CanonicalFoundLHS,
                                    CanonicalFoundRHS);
-    if (ICmpInst::isUnsigned(CanonicalPred) && isKnownNegative(CanonicalRHS))
+    if (!IsSwapped && ICmpInst::isUnsigned(CanonicalPred) &&
+        isKnownNegative(CanonicalRHS))
       // Use implication:
       // x <s y && y <s 0 --> x <u y.
       // If we can prove the left part, the right part is also proven.
