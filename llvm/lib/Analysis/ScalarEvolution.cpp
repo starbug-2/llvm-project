@@ -12243,19 +12243,19 @@ bool ScalarEvolution::isImpliedCondBalancedTypes(
   // the query "x >s -1" becomes "-1 <s x" for the found condition "x <u y".
   CmpPredicate SignFlippedPred = Pred;
   const SCEV *SignFlippedLHS = LHS, *SignFlippedRHS = RHS;
-  bool IsSwapped = false;
   if (!IsSignFlippedPredicate(Pred, FoundPred) &&
       IsSignFlippedPredicate(ICmpInst::getSwappedCmpPredicate(Pred),
                              FoundPred)) {
     SignFlippedPred = ICmpInst::getSwappedCmpPredicate(Pred);
     std::swap(SignFlippedLHS, SignFlippedRHS);
-    IsSwapped = true;
   }
   if (IsSignFlippedPredicate(SignFlippedPred, FoundPred)) {
     // Unsigned comparison is the same as signed comparison when both the
     // operands are non-negative or negative.
-    if (!IsSwapped && haveSameSign(FoundLHS, FoundRHS))
-      return isImpliedCondOperands(Pred, LHS, RHS, FoundLHS, FoundRHS, CtxI);
+    if (haveSameSign(FoundLHS, FoundRHS) &&
+        isImpliedCondOperands(SignFlippedPred, SignFlippedLHS, SignFlippedRHS,
+                              FoundLHS, FoundRHS, CtxI))
+      return true;
     // Create local copies that we can freely swap and canonicalize our
     // conditions to "le/lt".
     CmpPredicate CanonicalPred = SignFlippedPred,
@@ -12298,22 +12298,22 @@ bool ScalarEvolution::isImpliedCondBalancedTypes(
           return true;
       }
     }
-    if (!IsSwapped && ICmpInst::isSigned(CanonicalPred) &&
-        isKnownNonNegative(CanonicalRHS))
+    if (ICmpInst::isSigned(CanonicalPred) && isKnownNonNegative(CanonicalRHS)) {
       // Use implication:
       // x <u y && y >=s 0 --> x <s y.
       // If we can prove the left part, the right part is also proven.
-      return isImpliedCondOperands(CanonicalFoundPred, CanonicalLHS,
-                                   CanonicalRHS, CanonicalFoundLHS,
-                                   CanonicalFoundRHS);
-    if (!IsSwapped && ICmpInst::isUnsigned(CanonicalPred) &&
-        isKnownNegative(CanonicalRHS))
+      if (isImpliedCondOperands(CanonicalFoundPred, CanonicalLHS, CanonicalRHS,
+                                CanonicalFoundLHS, CanonicalFoundRHS))
+        return true;
+    }
+    if (ICmpInst::isUnsigned(CanonicalPred) && isKnownNegative(CanonicalRHS)) {
       // Use implication:
       // x <s y && y <s 0 --> x <u y.
       // If we can prove the left part, the right part is also proven.
-      return isImpliedCondOperands(CanonicalFoundPred, CanonicalLHS,
-                                   CanonicalRHS, CanonicalFoundLHS,
-                                   CanonicalFoundRHS);
+      if (isImpliedCondOperands(CanonicalFoundPred, CanonicalLHS, CanonicalRHS,
+                                CanonicalFoundLHS, CanonicalFoundRHS))
+        return true;
+    }
   }
 
   // Check if we can make progress by sharpening ranges.
