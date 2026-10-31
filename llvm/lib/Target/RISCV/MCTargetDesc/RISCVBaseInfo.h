@@ -480,10 +480,21 @@ enum FenceField {
 };
 }
 
-// Starbug 2 execute-packet predicate nibble (one per operation).
-// Bits [3:1] are creg. Bit [0] is z.
-// creg 0 and z 0 is unconditional. creg 1..7 names x9..x15.
-// z 0 tests nonzero, z 1 tests zero. creg 0 and z 1 is reserved.
+// Starbug 2 execute-packet header.
+//
+//   31   29 28          21 20    16 15       8 7 6     0
+//   creg    sense           00000  lane mask  0 0001011
+//
+// creg 0 is an unconditional packet. creg 1..7 names x9..x15, and then every
+// occupied lane is gated by that register. Sense bit 28 (bit 7 of the field)
+// belongs to lane 0: 0 tests nonzero, 1 tests zero. Lane-mask bit 15 (bit 7
+// of the field) set means lane 0 is occupied. The following instructions are
+// packed in lane order, and the count is the number of set mask bits.
+//
+// The packetizer still records one nibble per instruction while it decides
+// the packet. That nibble is not the header encoding. Bits [3:1] are creg
+// and bit [0] is the sense. A nibble of 0 is unconditional. creg 0 with the
+// sense bit set is reserved.
 namespace RISCVSB2 {
 inline bool isValidPred(unsigned Imm) {
   return Imm <= 15 && !(((Imm >> 1) == 0) && (Imm & 1));
@@ -502,6 +513,32 @@ inline unsigned predRegNum(unsigned Imm) {
 // RegNum is the architectural register number, 9..15.
 inline unsigned encodePred(unsigned RegNum, bool TestZero) {
   return ((RegNum - 8) << 1) | (TestZero ? 1u : 0u);
+}
+
+// creg field of the header. 0 is unconditional, 1..7 is x9..x15.
+inline bool isValidCReg(unsigned CReg) { return CReg <= 7; }
+
+inline unsigned cregToRegNum(unsigned CReg) {
+  return CReg == 0 ? 0 : 8 + CReg;
+}
+
+// Bit 7 of the 8-bit sense or mask field is lane 0.
+inline unsigned laneFieldBit(unsigned Lane) { return 1u << (7 - Lane); }
+
+// Dense prefix: lanes 0..Len-1 occupied, the rest empty.
+inline unsigned denseLaneMask(unsigned Len) {
+  if (Len == 0 || Len > 8)
+    return 0;
+  return ((1u << Len) - 1u) << (8 - Len);
+}
+
+// Sense bits of lanes [First, First+Count) moved down to lanes [0, Count).
+inline unsigned sliceSense(unsigned Sense, unsigned First, unsigned Count) {
+  unsigned Out = 0;
+  for (unsigned I = 0; I < Count && First + I < 8; ++I)
+    if (Sense & laneFieldBit(First + I))
+      Out |= laneFieldBit(I);
+  return Out;
 }
 } // namespace RISCVSB2
 

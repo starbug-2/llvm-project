@@ -6,13 +6,12 @@
 # RUN: not llvm-mc -triple=riscv32 < %s 2>&1 \
 # RUN:     | FileCheck -check-prefix=CHECK-NO-EXT %s
 
-# Unconditional execute packet. Every predicate is creg=0, z=0.
-# parallel = 7 sets p0, p1, and p2, so the next four operations issue together.
-# p3 and reserved[11:7] are zero. Opcode is custom-0 (0001011).
-# CHECK-ASM-AND-OBJ: sb2.header un, un, un, un, 7
-# CHECK-ASM: encoding: [0x0b,0xe0,0x00,0x00]
+# Unconditional four-lane packet. Mask bit 7 is lane 0, so 240 is lanes 0-3.
+# Sense is ignored when the register field is 0. Opcode is custom-0 (0001011).
+# CHECK-ASM-AND-OBJ: sb2.header un, 0, 240
+# CHECK-ASM: encoding: [0x0b,0xf0,0x00,0x00]
 # CHECK-NO-EXT: :[[#@LINE+1]]:1: error: instruction requires the following: 'starbug-vliw' (Starbug execute-packet header)
-sb2.header un, un, un, un, 7
+sb2.header un, 0, 240
 # CHECK-ASM-AND-OBJ: add a0, a1, a2
 add a0, a1, a2
 # CHECK-ASM-AND-OBJ: add a3, a4, a5
@@ -22,8 +21,13 @@ add a6, a7, s2
 # CHECK-ASM-AND-OBJ: add s3, s4, s5
 add s3, s4, s5
 
-# Same header fields, written with architectural names. x9 is s1, x10 is a0,
-# x15 is a5. '!' selects the zero test (z = 1). parallel = 4 is p0 only.
-# CHECK-ASM-AND-OBJ: sb2.header s1, !a0, un, a5, 4
-# CHECK-ASM: encoding: [0x0b,0x80,0x0e,0x25]
-sb2.header x9, !x10, un, x15, 4
+# x9 is s1. Sense 128 tests lane 0 for zero and lane 1 for nonzero.
+# Mask 192 occupies lanes 0 and 1.
+# CHECK-ASM-AND-OBJ: sb2.header s1, 128, 192
+# CHECK-ASM: encoding: [0x0b,0xc0,0x00,0x30]
+sb2.header x9, 128, 192
+
+# All eight lanes, unconditional.
+# CHECK-ASM-AND-OBJ: sb2.header un, 0, 255
+# CHECK-ASM: encoding: [0x0b,0xff,0x00,0x00]
+sb2.header un, 0, 255

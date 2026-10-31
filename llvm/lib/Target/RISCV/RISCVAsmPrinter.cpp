@@ -305,18 +305,6 @@ void RISCVAsmPrinter::emitNTLHint(const MachineInstr *MI) {
   EmitToStreamer(*OutStreamer, Hint);
 }
 
-// Parallel field for a packet of Len operations. Bit 2 is p0, bit 1 is p1,
-// bit 0 is p2. The first Len-1 boundaries are parallel. p3 is not in this
-// field; the instruction fixes it to zero.
-static unsigned sb2ParallelForLength(int64_t Len) {
-  if (Len < 2)
-    return 0;
-  unsigned N = Len > 4 ? 4 : static_cast<unsigned>(Len);
-  unsigned Parallel = 0;
-  for (unsigned I = 0; I + 1 < N; ++I)
-    Parallel |= 1u << (2 - I);
-  return Parallel;
-}
 
 void RISCVAsmPrinter::emitInstruction(const MachineInstr *MI) {
   RISCV_MC::verifyInstructionPredicates(MI->getOpcode(), STI->getFeatureBits());
@@ -331,18 +319,17 @@ void RISCVAsmPrinter::emitInstruction(const MachineInstr *MI) {
 
   switch (MI->getOpcode()) {
   case RISCV::STARBUG_BUNDLE_HINT: {
-    // Operands are the length and four predicate nibbles. A missing nibble
-    // is unconditional. The packetizer has already rejected a group that
-    // would be wrong under read-at-start, write-at-end issue.
-    const int64_t Len = MI->getOperand(0).getImm();
+    // Operands are the length, the shared predicate register (0 is
+    // unconditional), and the per-lane sense field. The lane mask is the
+    // dense prefix of that length: bit 7 of the field is lane 0.
+    const unsigned Len = static_cast<unsigned>(MI->getOperand(0).getImm());
+    const int64_t CReg = MI->getOperand(1).getImm();
+    const int64_t Sense = MI->getOperand(2).getImm();
     MCInst Header;
     Header.setOpcode(RISCV::SB2_HEADER);
-    for (unsigned I = 0; I < 4; ++I) {
-      const int64_t Pred =
-          MI->getNumOperands() > I + 1 ? MI->getOperand(I + 1).getImm() : 0;
-      Header.addOperand(MCOperand::createImm(Pred));
-    }
-    Header.addOperand(MCOperand::createImm(sb2ParallelForLength(Len)));
+    Header.addOperand(MCOperand::createImm(CReg));
+    Header.addOperand(MCOperand::createImm(Sense));
+    Header.addOperand(MCOperand::createImm(RISCVSB2::denseLaneMask(Len)));
     EmitToStreamer(*OutStreamer, Header);
     return;
   }

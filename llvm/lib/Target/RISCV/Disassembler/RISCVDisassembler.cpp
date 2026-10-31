@@ -277,9 +277,17 @@ static DecodeStatus decodeImmFourOperand(MCInst &Inst,
   return MCDisassembler::Success;
 }
 
-static DecodeStatus decodeSB2Pred(MCInst &Inst, uint32_t Imm, int64_t Address,
+static DecodeStatus decodeSB2CReg(MCInst &Inst, uint32_t Imm, int64_t Address,
                                   const MCDisassembler *Decoder) {
-  if (!RISCVSB2::isValidPred(Imm))
+  if (!RISCVSB2::isValidCReg(Imm))
+    return MCDisassembler::Fail;
+  Inst.addOperand(MCOperand::createImm(Imm));
+  return MCDisassembler::Success;
+}
+
+static DecodeStatus decodeSB2Mask(MCInst &Inst, uint32_t Imm, int64_t Address,
+                                  const MCDisassembler *Decoder) {
+  if (Imm == 0 || Imm > 255)
     return MCDisassembler::Fail;
   Inst.addOperand(MCOperand::createImm(Imm));
   return MCDisassembler::Success;

@@ -215,7 +215,7 @@ class RISCVAsmParser : public MCTargetAsmParser {
   ParseStatus parseGPRPair(OperandVector &Operands, bool IsRV64Inst);
   ParseStatus parseFRMArg(OperandVector &Operands);
   ParseStatus parseFenceArg(OperandVector &Operands);
-  ParseStatus parseSB2Pred(OperandVector &Operands);
+  ParseStatus parseSB2CReg(OperandVector &Operands);
   ParseStatus parseRegList(OperandVector &Operands, bool MustIncludeS0 = false);
   ParseStatus parseRegListS0(OperandVector &Operands) {
     return parseRegList(Operands, /*MustIncludeS0=*/true);
@@ -643,11 +643,15 @@ public:
   /// ('iorw').
   bool isFenceArg() const { return Kind == KindTy::Fence; }
 
-  bool isSB2Pred() const {
+  bool isSB2CReg() const {
     int64_t Imm;
     if (!isExpr() || !evaluateConstantExpr(getExpr(), Imm) || Imm < 0)
       return false;
-    return RISCVSB2::isValidPred(static_cast<unsigned>(Imm));
+    return RISCVSB2::isValidCReg(static_cast<unsigned>(Imm));
+  }
+
+  bool isSB2Mask() const {
+    return isUImmPred([](int64_t Imm) { return Imm >= 1 && Imm <= 255; });
   }
 
   /// Return true if the operand is a valid floating point rounding mode.
@@ -2630,29 +2634,23 @@ ParseStatus RISCVAsmParser::parseFRMArg(OperandVector &Operands) {
   return ParseStatus::Success;
 }
 
-ParseStatus RISCVAsmParser::parseSB2Pred(OperandVector &Operands) {
-  bool TestZero = false;
+ParseStatus RISCVAsmParser::parseSB2CReg(OperandVector &Operands) {
   SMLoc S = getLoc();
-  if (getLexer().is(AsmToken::Exclaim)) {
-    TestZero = true;
-    Lex();
-  }
+  if (getLexer().is(AsmToken::Exclaim))
+    return TokError("predicate register must be 'un' or x9-x15");
 
   if (getLexer().isNot(AsmToken::Identifier))
-    return TokError("operand must be 'un', x9-x15, or !x9-!x15");
+    return TokError("predicate register must be 'un' or x9-x15");
 
   StringRef Name = getLexer().getTok().getIdentifier();
   SMLoc E = getTok().getEndLoc();
   unsigned Imm = 0;
-  if (Name == "un") {
-    if (TestZero)
-      return TokError("unconditional predicate cannot test zero");
-  } else {
+  if (Name != "un") {
     MCRegister Reg = matchRegisterNameHelper(Name);
     unsigned RegNum = Reg.id();
     if (!Reg || RegNum < RISCV::X9 || RegNum > RISCV::X15)
-      return TokError("predicate register must be x9-x15");
-    Imm = RISCVSB2::encodePred(RegNum - RISCV::X0, TestZero);
+      return TokError("predicate register must be 'un' or x9-x15");
+    Imm = RegNum - RISCV::X8;
   }
 
   Lex();
