@@ -74,7 +74,10 @@ struct SchedulerPolicy {
 };
 
 struct StarbugVLIWConfig {
-  unsigned NumLanes = 4;
+  unsigned NumLanes = 8;
+  // .bank0 and .bank1 both start 8-byte aligned, so bit 2 of each base is
+  // clear. 4 moves .bank1 onto the other bank, matching the scoreboard linker.
+  unsigned Bank1Skew = 0;
   SmallVector<LaneConfig, 8> Lanes;
   UnrollPolicy Unroll;
   SchedulerPolicy Scheduler;

@@ -1,9 +1,9 @@
 ; Packetizer safety tests for the Starbug execute-packet header.
 ;
-; sb2.header marks the following operations as one packet. Predicates in these
-; tests are unconditional. The parallel field is 7 for four operations, 6 for
-; three, and 4 for two. Hardware does not check independence, so a header is
-; emitted only for a group the packetizer has already proved safe.
+; sb2.header marks the following operations as one packet. The mask is a dense
+; prefix: 240 occupies lanes 0-3, 128 occupies lane 0. A sense of 0 tests
+; nonzero. Hardware does not check independence, so a header is emitted only
+; for a group the packetizer has already proved safe.
 ;
 ; RUN: llc -mtriple=riscv32 -mcpu=starbug-vliw -mattr=+m,+c < %s | FileCheck %s
 
@@ -26,7 +26,7 @@ define i32 @serial_chain(i32 %a, i32 %b) nounwind {
 define i32 @independent_ops(i32 %a, i32 %b, i32 %c, i32 %d,
                             i32 %e, i32 %f, i32 %g, i32 %h) nounwind {
 ; CHECK-LABEL: independent_ops:
-; CHECK: sb2.header un, un, un, un, 7
+; CHECK: sb2.header un, 0, 240
 ; CHECK-NEXT: mul
 ; CHECK-NEXT: mul
 ; CHECK-NEXT: mul
@@ -41,14 +41,12 @@ define i32 @independent_ops(i32 %a, i32 %b, i32 %c, i32 %d,
   ret i32 %r
 }
 
-; The machine has four slots. The printer's parallel field is only three bits,
-; and a packet of five operations is not a value it emits. 7 is four
-; operations, 6 is three, 4 is two.
+; The machine has eight slots. A packet wider than that is not emitted.
 define void @bundle_width_cap(ptr %p, i32 %a, i32 %b, i32 %c, i32 %d,
                               i32 %e, i32 %f) nounwind {
 ; CHECK-LABEL: bundle_width_cap:
 ; CHECK: sb2.header
-; CHECK-NOT: sb2.header un, un, un, un, 5
+; CHECK-NOT: sb2.header un, 0, 0
   %x1 = add i32 %a, %b
   %x2 = add i32 %c, %d
   %x3 = add i32 %e, %f
@@ -68,7 +66,7 @@ define void @bundle_width_cap(ptr %p, i32 %a, i32 %b, i32 %c, i32 %d,
 ; source is nonzero, so the header names the register and does not test zero.
 define void @predicated_then(i32 %c, i32 %a, i32 %b, ptr %p) nounwind {
 ; CHECK-LABEL: predicated_then:
-; CHECK: sb2.header {{!?[a-z][0-9]+}}, un, un, un, 0
+; CHECK: sb2.header {{[a-z][0-9]+}}, 0, 128
 ; CHECK-NOT: beq
   %nz = icmp ne i32 %c, 0
   br i1 %nz, label %then, label %join
@@ -83,8 +81,8 @@ join:
 ; so the two stores may write the same address.
 define void @predicated_diamond(i32 %c, i32 %a, i32 %b, ptr %p) nounwind {
 ; CHECK-LABEL: predicated_diamond:
-; CHECK: sb2.header {{[a-z][0-9]+}}, un, un, un, 0
-; CHECK: sb2.header !{{[a-z][0-9]+}}, un, un, un, 0
+; CHECK: sb2.header {{[a-z][0-9]+}}, 0, 128
+; CHECK: sb2.header {{[a-z][0-9]+}}, 128, 128
   %nz = icmp ne i32 %c, 0
   br i1 %nz, label %then, label %else
 then:

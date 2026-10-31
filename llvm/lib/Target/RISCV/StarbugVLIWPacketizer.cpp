@@ -6,12 +6,14 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/LivePhysRegs.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/CodeGen/TargetOpcodes.h"
+#include "llvm/IR/GlobalValue.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Support/Debug.h"
@@ -305,6 +307,231 @@ static bool isLikelyLSUOp(const MachineInstr &MI, const RISCVInstrInfo &TII) {
   return MI.mayLoad() || MI.mayStore();
 }
 
+// Bank is address bit 2. Both .bank0 and .bank1 start 8-byte aligned, so each
+// base has bit 2 clear. Bank1Skew of 4 moves .bank1 onto the other bank. A
+// constant offset flips the bank when its bit 2 is set. SP is 16-byte aligned,
+// so a frame slot plus a constant offset is bit 2 of that sum. Anything else
+// is unknown, and an unknown bank is the only memory operation in its packet.
+static std::optional<unsigned> bankFromSection(const GlobalValue &GV,
+                                               int64_t Disp,
+                                               unsigned Bank1Skew) {
+  StringRef Section = GV.getSection();
+  unsigned Bit = 0;
+  if (Section == ".bank0" || Section.starts_with(".bank0."))
+    Bit = 0;
+  else if (Section == ".bank1" || Section.starts_with(".bank1."))
+    Bit = (Bank1Skew >> 2) & 1u;
+  else
+    return std::nullopt;
+  return Bit ^ static_cast<unsigned>((Disp >> 2) & 1);
+}
+
+// The last definition of Reg in MBB before Before. A null Before searches from
+// the end of the block, including the last instruction.
+static const MachineInstr *findDefBefore(const MachineBasicBlock &MBB,
+                                         const MachineInstr *Before,
+                                         Register Reg) {
+  auto It = Before ? Before->getIterator() : MBB.end();
+  while (It != MBB.begin()) {
+    --It;
+    for (const MachineOperand &MO : It->operands())
+      if (MO.isReg() && MO.isDef() && MO.getReg() == Reg)
+        return &*It;
+  }
+  return nullptr;
+}
+
+// A phi whose latch value is addi or c.addi of the phi by a nonzero immediate.
+// Incoming is the value from the single predecessor outside the block.
+static bool phiPreheader(const MachineInstr &Phi, Register &Incoming,
+                         MachineBasicBlock *&Pred) {
+  if (!Phi.isPHI() || !Phi.getParent())
+    return false;
+  const MachineBasicBlock &Loop = *Phi.getParent();
+  Incoming = Register();
+  Pred = nullptr;
+  Register Latch;
+  bool SawLatch = false;
+  for (unsigned I = 1; I + 1 < Phi.getNumOperands(); I += 2) {
+    if (!Phi.getOperand(I).isReg() || !Phi.getOperand(I + 1).isMBB())
+      return false;
+    MachineBasicBlock *From = Phi.getOperand(I + 1).getMBB();
+    if (From == &Loop) {
+      if (SawLatch)
+        return false;
+      SawLatch = true;
+      Latch = Phi.getOperand(I).getReg();
+    } else {
+      if (Pred)
+        return false;
+      Pred = From;
+      Incoming = Phi.getOperand(I).getReg();
+    }
+  }
+  if (!Pred || !Incoming || !SawLatch || !Latch)
+    return false;
+  const Register PhiReg = Phi.getOperand(0).getReg();
+  const MachineInstr *Step = findDefBefore(Loop, nullptr, Latch);
+  if (!Step || Step == &Phi)
+    return false;
+  const unsigned Opc = Step->getOpcode();
+  Register Src;
+  int64_t Imm = 0;
+  if (Opc == RISCV::ADDI && Step->getNumOperands() >= 3 &&
+      Step->getOperand(1).isReg() && Step->getOperand(2).isImm()) {
+    Src = Step->getOperand(1).getReg();
+    Imm = Step->getOperand(2).getImm();
+  } else if (Opc == RISCV::C_ADDI && Step->getNumOperands() >= 2 &&
+             Step->getOperand(0).isReg() && Step->getOperand(1).isImm()) {
+    Src = Step->getOperand(0).getReg();
+    Imm = Step->getOperand(1).getImm();
+  } else {
+    return false;
+  }
+  // A step that sets address bit 2 changes the bank on every iteration, so
+  // this instruction has no single bank. A step of 8 bytes or more that
+  // leaves bit 2 alone keeps the preheader's bank.
+  return Imm != 0 && (Imm & 4) == 0 && Src == PhiReg;
+}
+
+static std::optional<unsigned> memoryBank(const MachineInstr &Start,
+                                          unsigned Bank1Skew) {
+  const MachineFunction *MF =
+      Start.getParent() ? Start.getParent()->getParent() : nullptr;
+  int64_t Disp = 0;
+  const GlobalValue *GV = nullptr;
+  bool SawFI = false;
+  for (const MachineOperand &MO : Start.operands()) {
+    if (MO.isImm())
+      Disp += MO.getImm();
+    else if (MO.isGlobal()) {
+      GV = MO.getGlobal();
+      Disp += MO.getOffset();
+    } else if (MO.isFI() && MF) {
+      Disp += MF->getFrameInfo().getObjectOffset(MO.getIndex());
+      SawFI = true;
+    }
+  }
+  if (GV)
+    return bankFromSection(*GV, Disp, Bank1Skew);
+  if (SawFI)
+    return static_cast<unsigned>((Disp >> 2) & 1);
+
+  if (!Start.getParent())
+    return std::nullopt;
+  Register Base = getMemoryBaseReg(Start);
+  const MachineInstr *Cursor = &Start;
+  const MachineBasicBlock *Block = Start.getParent();
+  for (unsigned Steps = 0; Steps < 6; ++Steps) {
+    if (!Base || !Block)
+      return std::nullopt;
+    if (Base == RISCV::X2)
+      return static_cast<unsigned>((Disp >> 2) & 1);
+    const MachineInstr *Def = findDefBefore(*Block, Cursor, Base);
+    if (!Def)
+      return std::nullopt;
+
+    if (Def->isPHI()) {
+      Register Incoming;
+      MachineBasicBlock *Pred = nullptr;
+      if (!phiPreheader(*Def, Incoming, Pred))
+        return std::nullopt;
+      // The step is the latch update. This iteration's address is the
+      // preheader value plus the displacement already accumulated.
+      Base = Incoming;
+      Cursor = nullptr;
+      Block = Pred;
+      continue;
+    }
+
+    const GlobalValue *DefGV = nullptr;
+    int64_t Add = 0;
+    bool SawImm = false;
+    Register Next;
+    for (const MachineOperand &MO : Def->operands()) {
+      if (MO.isGlobal()) {
+        DefGV = MO.getGlobal();
+        Add += MO.getOffset();
+      } else if (MO.isImm()) {
+        Add += MO.getImm();
+        SawImm = true;
+      } else if (MO.isReg() && MO.isUse() && !Next)
+        Next = MO.getReg();
+    }
+    const unsigned Opc = Def->getOpcode();
+    const bool IsAdd = Opc == RISCV::ADDI || Opc == RISCV::C_ADDI ||
+                       Opc == RISCV::C_ADDI16SP || Opc == RISCV::C_ADDI4SPN;
+    if (DefGV) {
+      Disp += Add;
+      return bankFromSection(*DefGV, Disp, Bank1Skew);
+    }
+    if (!IsAdd || !Next || !SawImm)
+      return std::nullopt;
+    Disp += Add;
+    Base = Next;
+    Cursor = Def;
+    Block = Def->getParent();
+  }
+  return std::nullopt;
+}
+
+// True when adding Cand, a memory operation, keeps the packet at one access
+// per bank and at most two memory operations.
+static bool memoryBanksAllow(ArrayRef<MachineInstr *> Members,
+                             const MachineInstr &Cand, unsigned Bank1Skew) {
+  std::optional<unsigned> Existing;
+  bool ExistingUnknown = false;
+  unsigned Count = 0;
+  for (const MachineInstr *MI : Members) {
+    if (!MI->mayLoad() && !MI->mayStore())
+      continue;
+    ++Count;
+    std::optional<unsigned> Bank = memoryBank(*MI, Bank1Skew);
+    if (!Bank)
+      ExistingUnknown = true;
+    else
+      Existing = Bank;
+  }
+  if (Count >= 2)
+    return false;
+  if (Count == 0)
+    return true;
+  std::optional<unsigned> CandBank = memoryBank(Cand, Bank1Skew);
+  if (ExistingUnknown || !CandBank || !Existing)
+    return false;
+  return *Existing != *CandBank;
+}
+
+// A predicated packet uses one register for every occupied lane. Opposite
+// sense bits are fine. A mix with an unconditional member is not.
+static bool predicatesAllow(ArrayRef<MachineInstr *> Members,
+                            const MachineInstr &Cand,
+                            const DenseMap<MachineInstr *, unsigned> &Preds) {
+  unsigned CReg = 0;
+  bool AnyPred = false;
+  bool AnyUncond = false;
+  auto Note = [&](unsigned Nibble) {
+    if (Nibble == 0) {
+      AnyUncond = true;
+      return;
+    }
+    unsigned C = RISCVSB2::predCreg(Nibble);
+    if (C == 0 || (AnyPred && C != CReg)) {
+      AnyPred = true;
+      CReg = ~0u;
+      return;
+    }
+    CReg = C;
+    AnyPred = true;
+  };
+  for (MachineInstr *MI : Members)
+    Note(Preds.lookup(MI));
+  Note(Preds.lookup(const_cast<MachineInstr *>(&Cand)));
+  if (CReg == ~0u)
+    return false;
+  return !(AnyPred && AnyUncond);
+}
+
 static bool mayReorderAcross(const MachineInstr &A, const MachineInstr &B,
                              bool AssumeNoMemoryAlias) {
   // Conservative memory ordering model: do not move stores across memory ops,
@@ -386,9 +613,9 @@ static bool canHoistCandidate(MachineBasicBlock::iterator InsertPos,
 // placed in a worker lane is silently dropped rather than faulting. Anything
 // reading the PC is also lane-0 only because every lane is fed the same PCE.
 static bool isLane0OnlyMI(const MachineInstr &MI) {
-  return MI.mayLoad() || MI.mayStore() || MI.isBranch() || MI.isCall() ||
-         MI.isReturn() || MI.isTerminator() || MI.isBarrier() ||
-         MI.hasUnmodeledSideEffects() || isPCRelativeSetupMI(MI);
+  return MI.isBranch() || MI.isCall() || MI.isReturn() || MI.isTerminator() ||
+         MI.isBarrier() || MI.hasUnmodeledSideEffects() ||
+         isPCRelativeSetupMI(MI);
 }
 
 /// Are these instructions independent enough to be freely permuted?
@@ -415,6 +642,33 @@ static bool arePacketMembersIndependent(ArrayRef<MachineInstr *> Members,
     }
   }
   return true;
+}
+
+// Nibbles are the packetizer's per-instruction notes. The header has one
+// register and one sense bit per lane, so a packet is encodable only when
+// every occupied lane is unconditional, or every occupied lane names the
+// same register. A mix is split by the caller.
+static bool encodeSharedPred(ArrayRef<unsigned> Nibbles, unsigned &CReg,
+                             unsigned &Sense) {
+  CReg = 0;
+  Sense = 0;
+  bool AnyPred = false;
+  bool AnyUncond = false;
+  for (unsigned Lane = 0; Lane < Nibbles.size(); ++Lane) {
+    const unsigned N = Nibbles[Lane];
+    if (N == 0) {
+      AnyUncond = true;
+      continue;
+    }
+    const unsigned C = RISCVSB2::predCreg(N);
+    if (C == 0 || (AnyPred && C != CReg))
+      return false;
+    CReg = C;
+    AnyPred = true;
+    if (RISCVSB2::predTestsZero(N))
+      Sense |= RISCVSB2::laneFieldBit(Lane);
+  }
+  return !(AnyPred && AnyUncond);
 }
 
 static bool complementaryPredicates(unsigned A, unsigned B) {
@@ -510,7 +764,7 @@ static bool dependenciesAreComplementaryWaw(
 static bool isPacketSafeToHint(
     MachineBasicBlock &MBB, MachineInstr &First, unsigned PacketSize,
     bool DebugTransparent, const TargetRegisterInfo &TRI,
-    const DenseMap<MachineInstr *, unsigned> &Preds) {
+    const DenseMap<MachineInstr *, unsigned> &Preds, unsigned Bank1Skew) {
   if (PacketSize == 0)
     return false;
 
@@ -533,21 +787,30 @@ static bool isPacketSafeToHint(
     ++It;
   }
 
+  std::optional<unsigned> SeenBank;
+  bool SeenUnknown = false;
   unsigned MemoryOps = 0;
   for (unsigned I = 0; I < Members.size(); ++I) {
     const MachineInstr &MI = *Members[I];
-    const bool IsMem = MI.mayLoad() || MI.mayStore();
-    if (IsMem) {
+    if (MI.mayLoad() || MI.mayStore()) {
       ++MemoryOps;
-      // The single LSU is wired to lane 0.
-      if (I != 0)
+      if (MemoryOps > 2)
         return false;
+      std::optional<unsigned> Bank = memoryBank(MI, Bank1Skew);
+      if (!Bank) {
+        // An unknown bank stays the only memory operation.
+        if (MemoryOps > 1)
+          return false;
+        SeenUnknown = true;
+      } else if (SeenUnknown || (SeenBank && *SeenBank == *Bank)) {
+        return false;
+      } else {
+        SeenBank = Bank;
+      }
     }
     if (I != 0 && isLane0OnlyMI(MI))
       return false;
   }
-  if (MemoryOps > 1)
-    return false;
 
   // Every lane reads the register file in the same cycle and writes back in
   // the same cycle, so a RAW pair can never be satisfied and a WAW pair has no
@@ -727,7 +990,7 @@ bool StarbugVLIWPacketizer::predicateBranches(MachineFunction &MF,
             MI.hasUnmodeledSideEffects() || DefinesPred(MI))
           return false;
         Body.push_back(&MI);
-        if (Body.size() > 4)
+        if (Body.size() > 8)
           return false;
       }
       return true;
@@ -935,13 +1198,14 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
         const unsigned Pred = Predicates.lookup(MI);
         if (!Pred)
           continue;
+        unsigned CReg = 0, Sense = 0;
+        unsigned Nibble = Pred;
+        encodeSharedPred(ArrayRef<unsigned>(&Nibble, 1), CReg, Sense);
         BuildMI(MBB, MI->getIterator(), MI->getDebugLoc(),
                 TII->get(RISCV::STARBUG_BUNDLE_HINT))
             .addImm(1)
-            .addImm(Pred)
-            .addImm(0)
-            .addImm(0)
-            .addImm(0);
+            .addImm(CReg)
+            .addImm(Sense);
         Changed = true;
       }
       abandonPacket();
@@ -963,7 +1227,7 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
     PacketOrder.reserve(Packet.size());
     int MustBeFirst = -1;
     for (unsigned I = 0; I < Packet.size(); ++I) {
-      if (!isLikelyLSUOp(*Packet[I], *TII) && !isLane0OnlyMI(*Packet[I]))
+      if (!isLane0OnlyMI(*Packet[I]))
         continue;
       if (MustBeFirst >= 0) {
         // Two members both need lane 0; no legal placement exists. Leave them
@@ -1064,15 +1328,21 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
     // predicated member. Verify the real emitted sequence first.
     if (ShouldEmitHint && PacketSize <= Config.maxBundleWidth()) {
       MachineInstr &First = *Packet.front();
-      if (isPacketSafeToHint(MBB, First, PacketSize,
+      SmallVector<unsigned, 8> Nibbles;
+      Nibbles.reserve(Packet.size());
+      for (MachineInstr *Member : Packet)
+        Nibbles.push_back(Predicates.lookup(Member));
+      unsigned CReg = 0, Sense = 0;
+      const bool Shared = encodeSharedPred(Nibbles, CReg, Sense);
+      if (Shared &&
+          isPacketSafeToHint(MBB, First, PacketSize,
                              Config.Scheduler.DebugInstrsTransparent, *TRI,
-                             Predicates)) {
-        auto Hint = BuildMI(MBB, First, First.getDebugLoc(),
-                            TII->get(RISCV::STARBUG_BUNDLE_HINT))
-                        .addImm(static_cast<int64_t>(PacketSize));
-        for (unsigned Slot = 0; Slot < 4; ++Slot)
-          Hint.addImm(Slot < Packet.size() ? Predicates.lookup(Packet[Slot])
-                                           : 0);
+                             Predicates, Config.Bank1Skew)) {
+        BuildMI(MBB, First, First.getDebugLoc(),
+                TII->get(RISCV::STARBUG_BUNDLE_HINT))
+            .addImm(static_cast<int64_t>(PacketSize))
+            .addImm(CReg)
+            .addImm(Sense);
         ++NumPacketsEmitted;
         Changed = true;
       } else {
@@ -1103,13 +1373,14 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
           const unsigned Pred = Predicates.lookup(MI);
           if (!Pred)
             continue;
+          unsigned CReg = 0, Sense = 0;
+          unsigned Nibble = Pred;
+          encodeSharedPred(ArrayRef<unsigned>(&Nibble, 1), CReg, Sense);
           BuildMI(MBB, MI->getIterator(), MI->getDebugLoc(),
                   TII->get(RISCV::STARBUG_BUNDLE_HINT))
               .addImm(1)
-              .addImm(Pred)
-              .addImm(0)
-              .addImm(0)
-              .addImm(0);
+              .addImm(CReg)
+              .addImm(Sense);
           Changed = true;
         }
       }
@@ -1133,10 +1404,6 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
 
     SmallVector<unsigned, 8> SimLanes(PacketLanes.begin(), PacketLanes.end());
     SimLanes.push_back(ChosenLane);
-    bool SimHasLSU = false;
-    for (MachineInstr *PMI : Packet)
-      SimHasLSU |= isLikelyLSUOp(*PMI, *TII);
-    SimHasLSU |= isLikelyLSUOp(*ChosenIt, *TII);
 
     const unsigned LookAhead = std::max(1u, Config.Scheduler.PacketizerLookAhead);
     unsigned Seen = 0;
@@ -1181,13 +1448,12 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
       if (CandLane < 0)
         continue;
       const bool CandIsLSU = isLikelyLSUOp(*It, *TII);
-      if (CandIsLSU && (SimHasLSU || CandLane != 0))
+      if (CandIsLSU && !memoryBanksAllow(Packet, *It, Config.Bank1Skew))
         continue;
 
       SimLanes.push_back(static_cast<unsigned>(CandLane));
       SimUses.insert(CandUses.begin(), CandUses.end());
       SimDefs.insert(CandDefs.begin(), CandDefs.end());
-      SimHasLSU |= CandIsLSU;
       ++Additional;
       if (SimLanes.size() >= Config.maxBundleWidth())
         break;
@@ -1372,10 +1638,10 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
       if (CandLane < 0)
         continue;
       const bool CandIsLSU = isLikelyLSUOp(*CandIt, *TII);
-      if (CandIsLSU) {
-        if (PacketHasLSU || CandLane != 0)
-          continue;
-      }
+      if (CandIsLSU && !memoryBanksAllow(Packet, *CandIt, Config.Bank1Skew))
+        continue;
+      if (!Packet.empty() && !predicatesAllow(Packet, *CandIt, Predicates))
+        continue;
       const unsigned NumLaneChoices = countLaneChoices(CandClass, PacketLanes);
       const unsigned AdditionalFill =
           estimateAdditionalFill(MII, CandIt, CandUses, CandDefs,

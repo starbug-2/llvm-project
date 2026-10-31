@@ -6,11 +6,14 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Four-wide in-order issue. A packet reads sources at the start of the cycle
+// Eight-wide in-order issue. A packet reads sources at the start of the cycle
 // and writes results at the end, so every modeled latency is 1.
 //
-// Integer load and store take the one memory resource. Integer multiply, add,
-// and branch take an issue slot. InstRW is limited to those opcodes.
+// Two memory resources are permission to issue two memory operations in one
+// cycle. TableGen cannot see address bit 2; the packetizer rejects a pair
+// that resolves to the same bank. Integer arithmetic, shifts, logic,
+// compares, moves, branches, and the compressed forms of those take an
+// issue slot.
 //
 // A WriteRes for any one class makes tablegen require a resource for every
 // RISC-V sched class, including vector. The foreach below marks every other
@@ -19,15 +22,15 @@
 
 def StarbugVLIWModel : SchedMachineModel {
   let MicroOpBufferSize = 0;
-  let IssueWidth = 4;
+  let IssueWidth = 8;
   let LoadLatency = 1;
   let MispredictPenalty = 1;
   let CompleteModel = 0;
 }
 
 let SchedModel = StarbugVLIWModel in {
-  def StarbugIssue : ProcResource<4>;
-  def StarbugMem : ProcResource<1>;
+  def StarbugIssue : ProcResource<8>;
+  def StarbugMem : ProcResource<2>;
 
   def StarbugIssueWrite : SchedWriteRes<[StarbugIssue]> { let Latency = 1; }
   def StarbugMemWrite : SchedWriteRes<[StarbugMem]> { let Latency = 1; }
@@ -43,9 +46,24 @@ let SchedModel = StarbugVLIWModel in {
   }
 
   def : InstRW<[StarbugMemWrite],
-               (instrs LB, LH, LW, LBU, LHU, SB, SH, SW)>;
+               (instrs LB, LH, LW, LBU, LHU, SB, SH, SW,
+                       C_LW, C_LWSP, C_SW, C_SWSP)>;
   def : InstRW<[StarbugIssueWrite],
-               (instrs MUL, MULH, MULHSU, MULHU, ADD, ADDI)>;
+               (instrs MUL, MULH, MULHSU, MULHU, MULW,
+                       DIV, DIVU, DIVW, DIVUW, REM, REMU, REMW, REMUW)>;
   def : InstRW<[StarbugIssueWrite],
-               (instrs BEQ, BNE, BLT, BGE, BLTU, BGEU)>;
+               (instrs ADD, ADDI, SUB, ADDW, ADDIW, SUBW,
+                       C_ADD, C_ADDI, C_ADDI16SP, C_ADDI4SPN, C_SUB,
+                       C_ADDW, C_SUBW)>;
+  def : InstRW<[StarbugIssueWrite],
+               (instrs SLL, SLLI, SRL, SRLI, SRA, SRAI,
+                       SLLW, SLLIW, SRLW, SRLIW, SRAW, SRAIW,
+                       C_SLLI, C_SRLI, C_SRAI)>;
+  def : InstRW<[StarbugIssueWrite],
+               (instrs XOR, XORI, OR, ORI, AND, ANDI,
+                       C_XOR, C_OR, C_AND, C_ANDI)>;
+  def : InstRW<[StarbugIssueWrite],
+               (instrs SLT, SLTI, SLTU, SLTIU, LUI, C_LUI, C_LI, C_MV)>;
+  def : InstRW<[StarbugIssueWrite],
+               (instrs BEQ, BNE, BLT, BGE, BLTU, BGEU, C_BEQZ, C_BNEZ)>;
 }

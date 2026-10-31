@@ -28,6 +28,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "MCTargetDesc/RISCVBaseInfo.h"
 #include "RISCV.h"
 #include "RISCVInstrInfo.h"
 #include "RISCVSubtarget.h"
@@ -251,12 +252,9 @@ bool StarbugVLIWBundleLayout::repairFirstStraddle(
       ++Scan;
     }
 
-    const bool HasPred = [&]() {
-      for (unsigned P = 1; P < MI.getNumOperands() && P <= 4; ++P)
-        if (MI.getOperand(P).isImm() && MI.getOperand(P).getImm() != 0)
-          return true;
-      return false;
-    }();
+    const unsigned CReg = static_cast<unsigned>(MI.getOperand(1).getImm());
+    const unsigned Sense = static_cast<unsigned>(MI.getOperand(2).getImm());
+    const bool HasPred = CReg != 0;
 
     if (Members.size() != Len) {
       // A predicated header is the only thing keeping its operation off the
@@ -323,39 +321,31 @@ bool StarbugVLIWBundleLayout::repairFirstStraddle(
       dbgs() << " (" << Before << " -> " << After << " issue cycles)\n";
     });
 
-    uint32_t Preds[4] = {0, 0, 0, 0};
-    for (unsigned P = 0; P < 4 && P + 1 < MI.getNumOperands(); ++P)
-      Preds[P] = static_cast<uint32_t>(MI.getOperand(P + 1).getImm());
-
     const DebugLoc DL = MI.getDebugLoc();
     MI.eraseFromParent();
     for (const Group &G : Groups) {
       if (G.Hinted) {
         MachineInstr *FirstMember = Members[G.First];
-        auto Hint =
-            BuildMI(*FirstMember->getParent(), FirstMember->getIterator(), DL,
-                    TII.get(RISCV::STARBUG_BUNDLE_HINT))
-                .addImm(static_cast<int64_t>(G.Count));
-        for (unsigned P = 0; P < 4; ++P) {
-          const unsigned Src = G.First + P;
-          Hint.addImm(P < G.Count && Src < 4 ? Preds[Src] : 0);
-        }
+        BuildMI(*FirstMember->getParent(), FirstMember->getIterator(), DL,
+                TII.get(RISCV::STARBUG_BUNDLE_HINT))
+            .addImm(static_cast<int64_t>(G.Count))
+            .addImm(CReg)
+            .addImm(RISCVSB2::sliceSense(Sense, G.First, G.Count));
         continue;
       }
       // A member left scalar still has to carry its predicate. Without a
       // header the operation executes on the untaken path.
+      if (CReg == 0)
+        continue;
       for (unsigned P = 0; P < G.Count; ++P) {
         const unsigned Src = G.First + P;
-        if (Src >= 4 || Preds[Src] == 0)
-          continue;
         MachineInstr *Member = Members[Src];
+        const unsigned Bit = Sense & RISCVSB2::laneFieldBit(Src);
         BuildMI(*Member->getParent(), Member->getIterator(), DL,
                 TII.get(RISCV::STARBUG_BUNDLE_HINT))
             .addImm(1)
-            .addImm(Preds[Src])
-            .addImm(0)
-            .addImm(0)
-            .addImm(0);
+            .addImm(CReg)
+            .addImm(Bit ? RISCVSB2::laneFieldBit(0) : 0);
       }
     }
 
@@ -393,7 +383,7 @@ bool StarbugVLIWBundleLayout::runOnMachineFunction(MachineFunction &MF) {
   // sb2.header is a 32-bit custom-0 instruction.
   const unsigned HintBytes = 4;
   const unsigned MaxWidth =
-      std::min<unsigned>(4, RISCVVLIW::StarbugVLIWConfig::fromCommandLine()
+      std::min<unsigned>(8, RISCVVLIW::StarbugVLIWConfig::fromCommandLine()
                                 .maxBundleWidth());
 
   bool Changed = false;

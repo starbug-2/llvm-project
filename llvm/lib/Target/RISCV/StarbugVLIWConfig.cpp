@@ -10,18 +10,16 @@ using namespace llvm;
 using namespace llvm::RISCVVLIW;
 
 static cl::opt<unsigned> StarbugVLanes(
-    "starbug-vliw-lanes", cl::init(4), cl::Hidden,
+    "starbug-vliw-lanes", cl::init(8), cl::Hidden,
     cl::desc("Override Starbug VLIW lane count"));
 
 static cl::opt<bool> StarbugVForceUnroll(
     "starbug-vliw-force-unroll", cl::init(true), cl::Hidden,
     cl::desc("Force aggressive loop unrolling for Starbug VLIW"));
 
-// A 4-wide machine with 32 architectural registers needs only enough unrolling
-// to fill four lanes and cover load latency. Unrolling far past that spills,
-// and every spill is a memory op that serialises on the single lane-0 LSU --
-// so over-unrolling actively fights the mechanism. 8 is the measured knee;
-// sweep with -starbug-vliw-unroll-factor to reproduce.
+// Eight live results already press the 32 integer registers, and a spill is
+// another memory operation. The unroll factor stays at 8.
+// Sweep with -starbug-vliw-unroll-factor to reproduce.
 static cl::opt<unsigned> StarbugVUnrollFactor(
     "starbug-vliw-unroll-factor", cl::init(8), cl::Hidden,
     cl::desc("Preferred loop unroll factor for Starbug VLIW"));
@@ -65,6 +63,11 @@ static cl::opt<bool> StarbugVEmitSingleHints(
 static cl::opt<bool> StarbugVPacketizePCRel(
     "starbug-vliw-packetize-pcrel", cl::init(false), cl::Hidden,
     cl::desc("Allow packetizing PC-relative address setup instructions"));
+
+static cl::opt<unsigned> StarbugVBank1Skew(
+    "starbug-bank1-skew", cl::init(0), cl::Hidden,
+    cl::desc("Byte skew of the .bank1 section. 0 and 4 match the linker; "
+             "4 flips .bank1 onto the other memory bank"));
 
 static cl::opt<unsigned> StarbugVPacketizerLookAhead(
     "starbug-vliw-packetizer-lookahead", cl::init(64), cl::Hidden,
@@ -143,6 +146,11 @@ static LaneConfig makeALULane(unsigned LaneId) {
   L.AllowedClasses.set(static_cast<unsigned>(OpClass::Move));
   L.AllowedClasses.set(static_cast<unsigned>(OpClass::FPU));
   L.AllowedClasses.set(static_cast<unsigned>(OpClass::FPUDivSqrt));
+  // Two memory operations may issue together, on any lanes, when they touch
+  // different banks. The packetizer checks the bank. The lane only has to
+  // accept the opcode.
+  L.AllowedClasses.set(static_cast<unsigned>(OpClass::Load));
+  L.AllowedClasses.set(static_cast<unsigned>(OpClass::Store));
   return L;
 }
 
@@ -258,13 +266,12 @@ static bool applyLaneOpClassOverrides(StarbugVLIWConfig &Cfg, StringRef Spec) {
 
 StarbugVLIWConfig StarbugVLIWConfig::getDefault() {
   StarbugVLIWConfig Cfg;
-  Cfg.NumLanes = 4;
+  Cfg.NumLanes = 8;
 
   Cfg.Lanes.clear();
   Cfg.Lanes.push_back(makeLane0());
-  Cfg.Lanes.push_back(makeALULane(1));
-  Cfg.Lanes.push_back(makeALULane(2));
-  Cfg.Lanes.push_back(makeALULane(3));
+  for (unsigned Lane = 1; Lane < Cfg.NumLanes; ++Lane)
+    Cfg.Lanes.push_back(makeALULane(Lane));
 
   Cfg.Unroll.ForceUnroll = true;
   Cfg.Unroll.DefaultUnrollFactor = 8;
@@ -299,6 +306,7 @@ StarbugVLIWConfig StarbugVLIWConfig::fromCommandLine() {
   StarbugVLIWConfig Cfg = getDefault();
 
   Cfg.NumLanes = std::max(1u, StarbugVLanes.getValue());
+  Cfg.Bank1Skew = StarbugVBank1Skew.getValue();
   Cfg.Unroll.ForceUnroll = StarbugVForceUnroll;
   Cfg.Unroll.DefaultUnrollFactor = StarbugVUnrollFactor;
   Cfg.Unroll.MaxUnrollFactor = StarbugVMaxUnroll;

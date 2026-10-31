@@ -5179,11 +5179,51 @@ class RISCVPipelinerLoopInfo : public TargetInstrInfo::PipelinerLoopInfo {
   const MachineInstr *LHS;
   const MachineInstr *RHS;
   SmallVector<MachineOperand, 3> Cond;
+  MachineBasicBlock *LoopBB = nullptr;
+
+  static bool isConstStepOfPhi(const MachineInstr *Def, MachineBasicBlock *Loop,
+                               const MachineRegisterInfo &MRI) {
+    if (!Def || Def->getParent() != Loop)
+      return false;
+    Register Src;
+    int64_t Imm = 0;
+    if (Def->getOpcode() == RISCV::ADDI && Def->getNumOperands() >= 3 &&
+        Def->getOperand(1).isReg() && Def->getOperand(2).isImm()) {
+      Src = Def->getOperand(1).getReg();
+      Imm = Def->getOperand(2).getImm();
+    } else if (Def->getOpcode() == RISCV::C_ADDI &&
+               Def->getNumOperands() >= 2 && Def->getOperand(0).isReg() &&
+               Def->getOperand(1).isImm()) {
+      Src = Def->getOperand(0).getReg();
+      Imm = Def->getOperand(1).getImm();
+    } else {
+      return false;
+    }
+    if (Imm == 0 || !Src.isVirtual())
+      return false;
+    const MachineInstr *SrcDef = MRI.getVRegDef(Src);
+    return SrcDef && SrcDef->isPHI() && SrcDef->getParent() == Loop;
+  }
 
 public:
   RISCVPipelinerLoopInfo(const MachineInstr *LHS, const MachineInstr *RHS,
-                         const SmallVectorImpl<MachineOperand> &Cond)
-      : LHS(LHS), RHS(RHS), Cond(Cond.begin(), Cond.end()) {}
+                         const SmallVectorImpl<MachineOperand> &Cond,
+                         MachineBasicBlock *LoopBB)
+      : LHS(LHS), RHS(RHS), Cond(Cond.begin(), Cond.end()), LoopBB(LoopBB) {}
+
+  // A loop this hook cannot describe is left unpipelined. The caller drops
+  // the info object when this returns false.
+  bool canUpdateTripCount() const {
+    if (!LoopBB || Cond.size() < 3)
+      return false;
+    const MachineRegisterInfo &MRI = LoopBB->getParent()->getRegInfo();
+    auto ReadsIV = [&](const MachineOperand &Op) {
+      if (!Op.isReg() || !Op.getReg().isVirtual())
+        return false;
+      return isConstStepOfPhi(MRI.getVRegDef(Op.getReg()), LoopBB, MRI);
+    };
+    return ReadsIV(Cond[1]) || ReadsIV(Cond[2]);
+  }
 
   bool shouldIgnoreForPipelining(const MachineInstr *MI) const override {
     // Make the instructions for loop control be placed in stage 0.
@@ -5201,13 +5241,35 @@ public:
     // A branch instruction will be inserted as "if (Cond) goto epilogue".
     // Cond is normalized for such use.
     // The predecessors of the branch are assumed to have already been inserted.
+    (void)TC;
+    (void)MBB;
     CondParam = Cond;
     return {};
   }
 
-  void setPreheader(MachineBasicBlock *NewPreheader) override {}
+  void setPreheader(MachineBasicBlock *NewPreheader) override {
+    if (!LoopBB || !NewPreheader)
+      return;
+    for (MachineInstr &MI : LoopBB->phis()) {
+      for (unsigned I = 1; I + 1 < MI.getNumOperands(); I += 2) {
+        if (!MI.getOperand(I + 1).isMBB())
+          continue;
+        MachineBasicBlock *Pred = MI.getOperand(I + 1).getMBB();
+        if (Pred == LoopBB || Pred == NewPreheader)
+          continue;
+        if (!LoopBB->isPredecessor(Pred))
+          MI.getOperand(I + 1).setMBB(NewPreheader);
+      }
+    }
+  }
 
-  void adjustTripCount(int TripCountAdjust) override {}
+  void adjustTripCount(int TripCountAdjust) override {
+    // canUpdateTripCount only accepts a branch that reads a constant-step
+    // induction. The prolog executes that add and the kernel phi starts at
+    // the post-prolog value, so the original limit already counts the
+    // remaining trips. Moving the limit by TripCountAdjust would skip them.
+    (void)TripCountAdjust;
+  }
 };
 } // namespace
 
@@ -5250,7 +5312,10 @@ RISCVInstrInfo::analyzeLoopForPipelining(MachineBasicBlock *LoopBB) const {
   if (RHS && RHS->isPHI())
     return nullptr;
 
-  return std::make_unique<RISCVPipelinerLoopInfo>(LHS, RHS, Cond);
+  auto Info = std::make_unique<RISCVPipelinerLoopInfo>(LHS, RHS, Cond, LoopBB);
+  if (!Info->canUpdateTripCount())
+    return nullptr;
+  return Info;
 }
 
 // FIXME: We should remove this if we have a default generic scheduling model.
