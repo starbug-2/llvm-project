@@ -72,10 +72,17 @@ bool RISCVPreRAMachineSchedStrategy::tryCandidate(SchedCandidate &Cand,
     return true;
   }
 
+  // Avoid exceeding the target's limit before filling the cycle. An eighth
+  // operation that spills costs a memory operation, which is slower than
+  // leaving the slot empty.
+  if (DAG->isTrackingPressure() &&
+      tryPressure(TryCand.RPDelta.Excess, Cand.RPDelta.Excess, TryCand, Cand,
+                  RegExcess, TRI, DAG->MF))
+    return TryCand.Reason != NoCand;
+
   // An execute packet reads every source at the start of the cycle. Once the
   // cycle has an operation, prefer another ready operation over a dependent
-  // one that would open a new cycle. Register pressure still breaks the tie
-  // between operations that can both issue now.
+  // one that would open a new cycle, when neither would spill.
   if (ST->hasStarbugVLIW() && Zone && Zone->getCurrMOps() > 0 &&
       tryLess(Zone->getLatencyStallCycles(TryCand.SU),
               Zone->getLatencyStallCycles(Cand.SU), TryCand, Cand, Stall))
@@ -84,12 +91,6 @@ bool RISCVPreRAMachineSchedStrategy::tryCandidate(SchedCandidate &Cand,
   // Bias PhysReg Defs and copies to their uses and defined respectively.
   if (tryGreater(biasPhysReg(TryCand.SU, TryCand.AtTop),
                  biasPhysReg(Cand.SU, Cand.AtTop), TryCand, Cand, PhysReg))
-    return TryCand.Reason != NoCand;
-
-  // Avoid exceeding the target's limit.
-  if (DAG->isTrackingPressure() &&
-      tryPressure(TryCand.RPDelta.Excess, Cand.RPDelta.Excess, TryCand, Cand,
-                  RegExcess, TRI, DAG->MF))
     return TryCand.Reason != NoCand;
 
   // Avoid increasing the max critical pressure in the scheduled region.
