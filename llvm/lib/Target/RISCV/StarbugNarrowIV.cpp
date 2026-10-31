@@ -56,17 +56,25 @@ INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
 INITIALIZE_PASS_END(StarbugNarrowIV, DEBUG_TYPE,
                     "Narrow 64-bit loop IVs that fit in 32 bits", false, false)
 
+// A truncated use of the IV. Op is an add or sub of the IV with a value
+// defined outside the loop when the trunc is of that add or sub. Op is null
+// when the trunc reads the IV itself.
+struct IndexUse {
+  TruncInst *Trunc = nullptr;
+  BinaryOperator *Op = nullptr;
+};
+
 // A one-block loop whose i64 IV is only used as a 32-bit index, plus a +1
 // and an unsigned compare against a value defined outside the loop.
 struct NarrowCandidate {
   Loop *L = nullptr;
   PHINode *IV = nullptr;
-  TruncInst *Trunc = nullptr;
   BinaryOperator *Inc = nullptr;
   ICmpInst *Cmp = nullptr;
   Value *Start = nullptr;
   Value *Trip = nullptr;
   BasicBlock *Exit = nullptr;
+  SmallVector<IndexUse, 4> Indexes;
 };
 
 static bool collectCandidate(Loop *L, NarrowCandidate &C) {
@@ -120,20 +128,40 @@ static bool collectCandidate(Loop *L, NarrowCandidate &C) {
   if (!StepC || !StepC->isOne())
     return false;
 
-  TruncInst *Trunc = nullptr;
+  SmallVector<IndexUse, 4> Indexes;
+  Type *I32 = Type::getInt32Ty(H->getContext());
+  auto IsHeaderTrunc = [&](Value *V) -> TruncInst * {
+    auto *T = dyn_cast<TruncInst>(V);
+    if (!T || T->getDestTy() != I32 || T->getParent() != H)
+      return nullptr;
+    return T;
+  };
   for (User *U : IV->users()) {
     if (U == Inc)
       continue;
-    auto *T = dyn_cast<TruncInst>(U);
-    if (!T || T->getDestTy() != Type::getInt32Ty(H->getContext()) ||
-        T->getParent() != H)
+    if (TruncInst *T = IsHeaderTrunc(U)) {
+      Indexes.push_back({T, nullptr});
+      continue;
+    }
+    auto *Op = dyn_cast<BinaryOperator>(U);
+    if (!Op || Op->getParent() != H ||
+        (Op->getOpcode() != Instruction::Add &&
+         Op->getOpcode() != Instruction::Sub) ||
+        !Op->hasOneUse())
       return false;
-    if (Trunc)
+    Value *Other = Op->getOperand(0) == IV ? Op->getOperand(1) : nullptr;
+    if (Op->getOperand(1) == IV)
+      Other = Op->getOperand(0);
+    if (!Other || Other == IV)
       return false;
-    Trunc = T;
+    if (auto *OI = dyn_cast<Instruction>(Other))
+      if (L->contains(OI->getParent()))
+        return false;
+    TruncInst *T = IsHeaderTrunc(*Op->user_begin());
+    if (!T)
+      return false;
+    Indexes.push_back({T, Op});
   }
-  if (!Trunc)
-    return false;
 
   // The increment feeds the compare and comes back through the phi.
   ICmpInst *Cmp = nullptr;
@@ -163,7 +191,14 @@ static bool collectCandidate(Loop *L, NarrowCandidate &C) {
       return false;
   }
 
-  C = {L, IV, Trunc, Inc, Cmp, Start, Trip, Exit};
+  C.L = L;
+  C.IV = IV;
+  C.Inc = Inc;
+  C.Cmp = Cmp;
+  C.Start = Start;
+  C.Trip = Trip;
+  C.Exit = Exit;
+  C.Indexes = std::move(Indexes);
   return true;
 }
 
@@ -220,7 +255,24 @@ static bool narrowLoop(NarrowCandidate &C, LoopInfo &LI, DominatorTree &DT) {
   NewIV->addIncoming(Start32, PH);
   NewIV->addIncoming(NewInc, H);
 
-  C.Trunc->replaceAllUsesWith(NewIV);
+  for (IndexUse &IU : C.Indexes) {
+    if (!IU.Op) {
+      IU.Trunc->replaceAllUsesWith(NewIV);
+      continue;
+    }
+    Value *Other = IU.Op->getOperand(0) == C.IV ? IU.Op->getOperand(1)
+                                                : IU.Op->getOperand(0);
+    IRBuilder<> AtOp(IU.Op);
+    Value *Other32 = AtOp.CreateTrunc(Other, I32);
+    Value *Narrow = nullptr;
+    if (IU.Op->getOpcode() == Instruction::Add)
+      Narrow = AtOp.CreateAdd(NewIV, Other32, IU.Op->getName());
+    else if (IU.Op->getOperand(0) == C.IV)
+      Narrow = AtOp.CreateSub(NewIV, Other32, IU.Op->getName());
+    else
+      Narrow = AtOp.CreateSub(Other32, NewIV, IU.Op->getName());
+    IU.Trunc->replaceAllUsesWith(Narrow);
+  }
   IRBuilder<> AtCmp(C.Cmp);
   Value *NewCmp = AtCmp.CreateICmpULT(NewInc, Trip32, C.Cmp->getName());
   C.Cmp->replaceAllUsesWith(NewCmp);
@@ -230,10 +282,14 @@ static bool narrowLoop(NarrowCandidate &C, LoopInfo &LI, DominatorTree &DT) {
 
   // The old phi and the increment use each other, so drop the increment's
   // uses before deleting either one.
+  for (IndexUse &IU : C.Indexes)
+    IU.Trunc->eraseFromParent();
+  for (IndexUse &IU : C.Indexes)
+    if (IU.Op)
+      IU.Op->eraseFromParent();
   C.Cmp->eraseFromParent();
   C.Inc->replaceAllUsesWith(PoisonValue::get(I64));
   C.Inc->eraseFromParent();
-  C.Trunc->eraseFromParent();
   C.IV->eraseFromParent();
   return true;
 }
