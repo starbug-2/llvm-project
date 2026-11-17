@@ -15,16 +15,18 @@
 // scheduling heuristic in the packetizer put together.
 //
 // This pass runs last, when instruction sizes are final, and repairs the
-// layout. It never moves an instruction: it only re-places hints. Splitting a
-// bundle that has already been proven safe is unconditionally safe again --
-// the members keep their order, each part is a subsequence of an independent
-// set, and the one member that had to own lane 0 is still at index 0 of the
-// first part. So the pass cannot introduce a hazard, only recover cycles.
+// layout by re-placing hints. A header is also what makes a hoisted branch
+// legal: the packetizer moves that branch to lane 0, and every member still
+// runs before the branch takes effect. Dropping or splitting that header
+// without putting the branch back would let a taken branch skip the members
+// it used to follow. When an unconditional header cannot cover the whole
+// packet, the branch is moved back to the end of the group first.
 //
 // Two things have to hold for the offsets to be real:
 //   * the function must be aligned to the line, which the pass arranges;
 //   * linker relaxation must be off, since it deletes bytes inside functions
-//     after this point. -mno-relax is required, and diagnosed if missing.
+//     after this point. starbug-vliw clears the relax feature, and
+//     -mattr=+relax is rejected in the target machine.
 //
 //===----------------------------------------------------------------------===//
 
@@ -157,6 +159,32 @@ static unsigned predictedSize(const MachineInstr &MI, const RISCVInstrInfo &TII,
   }
 }
 
+// The packetizer's only reorder hoists a terminator into lane 0. Without a
+// header that still covers every member, a taken branch skips the operations
+// that used to sit in front of it. Move the terminator back to the end and
+// rotate the sense bits so each operation keeps its predicate.
+static void unhoistLeadingTerminator(MachineBasicBlock &MBB,
+                                     SmallVectorImpl<MachineInstr *> &Members,
+                                     SmallVectorImpl<unsigned> &Sizes,
+                                     unsigned &Sense) {
+  MachineInstr *Head = Members.front();
+  MachineInstr *Last = Members.back();
+  MBB.splice(std::next(Last->getIterator()), &MBB, Head->getIterator());
+  const unsigned N = Members.size();
+  unsigned Rotated = 0;
+  if (Sense & RISCVSB2::laneFieldBit(0))
+    Rotated |= RISCVSB2::laneFieldBit(N - 1);
+  for (unsigned I = 1; I < N && I < 8; ++I)
+    if (Sense & RISCVSB2::laneFieldBit(I))
+      Rotated |= RISCVSB2::laneFieldBit(I - 1);
+  Sense = Rotated;
+  Members.erase(Members.begin());
+  Members.push_back(Head);
+  const unsigned Sz = Sizes.front();
+  Sizes.erase(Sizes.begin());
+  Sizes.push_back(Sz);
+}
+
 static SmallVector<Group, 4> planGroups(ArrayRef<unsigned> Sizes,
                                         uint64_t Cursor, unsigned HintBytes,
                                         unsigned LineBytes,
@@ -197,7 +225,10 @@ static SmallVector<Group, 4> planGroups(ArrayRef<unsigned> Sizes,
 
 char StarbugVLIWBundleLayout::ID = 0;
 
-INITIALIZE_PASS(StarbugVLIWBundleLayout, DEBUG_TYPE,
+// The enable flag already owns the "starbug-vliw-bundle-layout" option, so
+// the legacy pass argument has to be a different string. opt's pass-name
+// parser registers that argument as a command-line option.
+INITIALIZE_PASS(StarbugVLIWBundleLayout, "starbug-bundle-layout",
                 STARBUG_VLIW_BUNDLE_LAYOUT_NAME, false, false)
 
 FunctionPass *llvm::createStarbugVLIWBundleLayoutPass() {
@@ -253,8 +284,11 @@ bool StarbugVLIWBundleLayout::repairFirstStraddle(
     }
 
     const unsigned CReg = static_cast<unsigned>(MI.getOperand(1).getImm());
-    const unsigned Sense = static_cast<unsigned>(MI.getOperand(2).getImm());
+    unsigned Sense = static_cast<unsigned>(MI.getOperand(2).getImm());
     const bool HasPred = CReg != 0;
+    const bool HoistedTerminator =
+        !HasPred && Members.size() >= 2 &&
+        (Members.front()->isBranch() || Members.front()->isReturn());
 
     if (Members.size() != Len) {
       // A predicated header is the only thing keeping its operation off the
@@ -264,6 +298,8 @@ bool StarbugVLIWBundleLayout::repairFirstStraddle(
         Offset += HintBytes;
         continue;
       }
+      if (HoistedTerminator)
+        unhoistLeadingTerminator(MBB, Members, Sizes, Sense);
       Offset += HintBytes;
       MI.eraseFromParent();
       ++NumHintsDropped;
@@ -286,6 +322,11 @@ bool StarbugVLIWBundleLayout::repairFirstStraddle(
     }
 
     ++NumStraddlingBundles;
+    // A straddling header cannot keep a hoisted terminator in lane 0: the
+    // pieces will not all share that header, and a taken branch would skip
+    // the operations that belong in front of it.
+    if (HoistedTerminator)
+      unhoistLeadingTerminator(MBB, Members, Sizes, Sense);
     SmallVector<Group, 4> Groups =
         planGroups(Sizes, Offset, HintBytes, LineBytes, MaxWidth);
 
