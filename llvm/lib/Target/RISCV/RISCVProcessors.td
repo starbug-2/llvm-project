@@ -92,8 +92,7 @@ class RISCVTuneProcessorModel<string n, SchedMachineModel m,
 defvar GenericTuneFeatures = [TuneOptimizedNF2SegmentLoadStore,
                               TuneEnableSelectOptimize];
 defvar StarbugTuneFeatures = [TuneOptimizedNF2SegmentLoadStore,
-                              TuneEnableSelectOptimize,
-                              TunePostRAScheduler];
+                              TuneEnableSelectOptimize];
 
 def GENERIC_RV32 : RISCVProcessorModel<"generic-rv32",
                                        NoSchedModel,

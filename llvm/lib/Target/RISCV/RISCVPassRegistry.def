@@ -17,4 +17,6 @@
 #define FUNCTION_PASS(NAME, CREATE_PASS)
 #endif
 FUNCTION_PASS("riscv-codegenprepare", RISCVCodeGenPreparePass(this))
+FUNCTION_PASS("starbug-narrow-iv", StarbugNarrowIVPass(this))
+FUNCTION_PASS("starbug-split-accum", StarbugSplitAccumPass(this))
 #undef FUNCTION_PASS

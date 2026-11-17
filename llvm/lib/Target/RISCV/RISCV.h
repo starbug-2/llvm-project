@@ -26,6 +26,22 @@ class RISCVRegisterBankInfo;
 class RISCVSubtarget;
 class RISCVTargetMachine;
 
+class StarbugNarrowIVPass : public PassInfoMixin<StarbugNarrowIVPass> {
+  const RISCVTargetMachine *TM;
+
+public:
+  explicit StarbugNarrowIVPass(const RISCVTargetMachine *TM) : TM(TM) {}
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM);
+};
+
+class StarbugSplitAccumPass : public PassInfoMixin<StarbugSplitAccumPass> {
+  const RISCVTargetMachine *TM;
+
+public:
+  explicit StarbugSplitAccumPass(const RISCVTargetMachine *TM) : TM(TM) {}
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM);
+};
+
 class RISCVCodeGenPreparePass : public PassInfoMixin<RISCVCodeGenPreparePass> {
 private:
   const RISCVTargetMachine *TM;
@@ -103,8 +119,6 @@ FunctionPass *createRISCVLoadStoreOptPass();
 void initializeRISCVLoadStoreOptPass(PassRegistry &);
 FunctionPass *createStarbugVLIWPacketizerPass();
 void initializeStarbugVLIWPacketizerPass(PassRegistry &);
-FunctionPass *createStarbugVLIWTraceSchedulerPass();
-void initializeStarbugVLIWTraceSchedulerPass(PassRegistry &);
 FunctionPass *createStarbugVLIWBundleLayoutPass();
 void initializeStarbugVLIWBundleLayoutPass(PassRegistry &);
 FunctionPass *createStarbugNarrowIVPass();

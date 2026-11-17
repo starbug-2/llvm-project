@@ -442,6 +442,8 @@ public:
 
   void overridePostRASchedPolicy(MachineSchedPolicy &Policy,
                                  const SchedRegion &Region) const override;
+
+  unsigned getMachineSchedRegionLimit() const override;
 };
 } // namespace llvm
 

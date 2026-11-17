@@ -115,22 +115,32 @@ define i32 @section_bases(i32 %x, i32 %y) nounwind {
   ret i32 %r3
 }
 
-; A[k] and B[k] step by one word. At skew 0 both pointers start on the same
-; bank and stay together. At skew 4 they start on opposite banks.
+; A[k] and B[k] step by one word. Load latency 2 keeps those loads in
+; different packets at either bank skew. The pre-RA resource model does know
+; the bank, so the surrounding schedule can differ. section_bases is the
+; skew check.
 @stride_a = global [8 x i32] zeroinitializer, section ".bank0", align 4
 @stride_b = global [8 x i32] zeroinitializer, section ".bank1", align 4
 
 define i32 @stride_pair() nounwind {
 ; CHECK-LABEL: stride_pair:
-; CHECK: addi a1, a2, 4
-; CHECK-NEXT: sb2.header un, 0, 240
-; CHECK-NEXT: beq
+; A 192 header covers two lanes, so the lw after the add is the next packet.
+; CHECK: beq
+; CHECK: sb2.header un, 0, 192
+; CHECK-NEXT: lw
+; CHECK-NEXT: add
+; CHECK-NEXT: lw
 ; SKEW4-LABEL: stride_pair:
-; SKEW4: sb2.header un, 0, 240
+; SKEW4: addi a3, a4, 32
+; SKEW4: sb2.header un, 0, 224
 ; SKEW4-NEXT: lw
 ; SKEW4-NEXT: addi
+; SKEW4-NEXT: add
 ; SKEW4-NEXT: addi
+; SKEW4-NEXT: beq
+; SKEW4: sb2.header un, 0, 192
 ; SKEW4-NEXT: lw
+; SKEW4-NEXT: add
 entry:
   br label %loop
 loop:

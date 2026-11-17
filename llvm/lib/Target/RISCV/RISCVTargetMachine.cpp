@@ -15,6 +15,7 @@
 #include "RISCV.h"
 #include "RISCVMachineFunctionInfo.h"
 #include "RISCVMachineScheduler.h"
+#include "StarbugVLIWMachineScheduler.h"
 #include "RISCVTargetObjectFile.h"
 #include "RISCVTargetTransformInfo.h"
 #include "TargetInfo/RISCVTargetInfo.h"
@@ -109,11 +110,6 @@ static cl::opt<bool> EnableStarbugMachinePipeliner(
     cl::desc("Enable the Machine Pipeliner for Starbug VLIW"),
     cl::init(true));
 
-static cl::opt<bool> EnableStarbugTraceScheduler(
-    "starbug-vliw-enable-trace-scheduler", cl::Hidden,
-    cl::desc("Enable experimental generic pre-RA trace staging for Starbug VLIW"),
-    cl::init(false));
-
 static cl::opt<bool> EnableCFIInstrInserter(
     "riscv-enable-cfi-instr-inserter",
     cl::desc("Enable CFI Instruction Inserter for RISC-V"), cl::init(false),
@@ -158,7 +154,6 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeRISCVTarget() {
   initializeRISCVIndirectBranchTrackingPass(*PR);
   initializeRISCVLoadStoreOptPass(*PR);
   initializeStarbugVLIWPacketizerPass(*PR);
-  initializeStarbugVLIWTraceSchedulerPass(*PR);
   initializeStarbugVLIWBundleLayoutPass(*PR);
   initializeStarbugNarrowIVPass(*PR);
   initializeRISCVPreAllocZilsdOptPass(*PR);
@@ -220,6 +215,26 @@ RISCVTargetMachine::getSubtargetImpl(const Function &F) const {
       TuneAttr.isValid() ? TuneAttr.getValueAsString().str() : CPU;
   std::string FS =
       FSAttr.isValid() ? FSAttr.getValueAsString().str() : TargetFS;
+
+  // -mattr=+relax on a Starbug compile is rejected. Clearing the feature
+  // inside the subtarget is what handles +relax left in clang's IR.
+  auto RelaxOnCommandLine = [](StringRef Features) {
+    bool On = false;
+    SmallVector<StringRef, 8> Tokens;
+    Features.split(Tokens, ',');
+    for (StringRef Tok : Tokens) {
+      if (Tok == "+relax")
+        On = true;
+      else if (Tok == "-relax")
+        On = false;
+    }
+    return On;
+  };
+  const bool IsStarbug =
+      CPU == "starbug-vliw" || StringRef(FS).contains("+starbug-vliw");
+  if (IsStarbug && RelaxOnCommandLine(getTargetFeatureString()))
+    reportFatalUsageError(
+        "linker relaxation cannot be enabled for starbug-vliw");
 
   unsigned RVVBitsMin = RVVVectorBitsMinOpt;
   unsigned RVVBitsMax = RVVVectorBitsMaxOpt;
@@ -309,6 +324,9 @@ bool RISCVTargetMachine::isNoopAddrSpaceCast(unsigned SrcAS,
 ScheduleDAGInstrs *
 RISCVTargetMachine::createMachineScheduler(MachineSchedContext *C) const {
   const RISCVSubtarget &ST = C->MF->getSubtarget<RISCVSubtarget>();
+  if (ST.hasStarbugVLIW())
+    return createStarbugVLIWMachineSched(C);
+
   ScheduleDAGMILive *DAG = createSchedLive<RISCVPreRAMachineSchedStrategy>(C);
 
   if (ST.enableMISchedLoadClustering())
@@ -664,8 +682,6 @@ void RISCVPassConfig::addPreRegAlloc() {
 
   const bool IsStarbugCPU =
       getRISCVTargetMachine().getTargetCPU() == "starbug-vliw";
-  if (IsStarbugCPU && EnableStarbugTraceScheduler)
-    addPass(createStarbugVLIWTraceSchedulerPass());
   const bool UseMachinePipeliner =
       EnableMachinePipeliner ||
       (IsStarbugCPU && EnableStarbugMachinePipeliner);
@@ -703,6 +719,16 @@ void RISCVTargetMachine::registerPassBuilderCallbacks(PassBuilder &PB) {
     if (Level != OptimizationLevel::O0)
       LPM.addPass(LoopIdiomVectorizePass(LoopIdiomVectorizeStyle::Predicated));
   });
+
+  // Narrow the IV and split reductions before the late unroller. Both are
+  // ILP transforms: the pipeliner can only overlap chains that already exist.
+  PB.registerVectorizerStartEPCallback(
+      [this](FunctionPassManager &FPM, OptimizationLevel Level) {
+        if (Level == OptimizationLevel::O0)
+          return;
+        FPM.addPass(StarbugNarrowIVPass(this));
+        FPM.addPass(StarbugSplitAccumPass(this));
+      });
 }
 
 yaml::MachineFunctionInfo *

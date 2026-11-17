@@ -1,4 +1,5 @@
 #include "StarbugVLIWPacketizer.h"
+#include "StarbugVLIWIssueRules.h"
 
 #include "RISCV.h"
 #include "RISCVSubtarget.h"
@@ -34,6 +35,13 @@ STATISTIC(NumPacketsRejected,
 namespace {
 
 using OpClass = RISCVVLIW::OpClass;
+using RISCVVLIW::MemBank;
+using RISCVVLIW::banksDifferEveryIteration;
+using RISCVVLIW::classifyOpClass;
+using RISCVVLIW::isPointerBump;
+using RISCVVLIW::memoryBank;
+using RISCVVLIW::memoryBanksAllow;
+
 
 static bool isPacketizableMI(const MachineInstr &MI) {
   if (MI.isDebugInstr() || MI.isMetaInstruction() ||
@@ -174,118 +182,6 @@ static bool hasPacketDependency(const DenseSet<Register> &MIUses,
          hasPacketAntiDependence(MIDefs, PacketUses, TRI);
 }
 
-// Does this instruction read or write the f-register file?
-//
-// This runs post-RA, so every register operand is already physical and its
-// register class answers the question directly. Testing the register file is
-// better than enumerating opcodes here: it covers F, D and Zfh in one rule and
-// it cannot silently miss an instruction the way an opcode list can.
-static bool touchesFPRegisters(const MachineInstr &MI) {
-  for (const MachineOperand &MO : MI.operands()) {
-    if (!MO.isReg())
-      continue;
-    Register Reg = MO.getReg();
-    if (!Reg || !Reg.isPhysical())
-      continue;
-    if (RISCV::FPR32RegClass.contains(Reg) ||
-        RISCV::FPR64RegClass.contains(Reg) ||
-        RISCV::FPR16RegClass.contains(Reg))
-      return true;
-  }
-  return false;
-}
-
-// fdiv and fsqrt drive FDivBusyE, which wallypipelinedcore.sv ORs across the
-// lanes into a core-wide execute stall (hazard.sv:87). They are still legal in
-// a worker lane -- they are just not free, so they get their own class and can
-// be excluded from worker lanes with -starbug-vliw-lane-op-classes for sweeps.
-static bool isFPDivSqrtOpcode(unsigned Opcode) {
-  switch (Opcode) {
-  case RISCV::FDIV_S:  case RISCV::FDIV_D:  case RISCV::FDIV_H:
-  case RISCV::FSQRT_S: case RISCV::FSQRT_D: case RISCV::FSQRT_H:
-    return true;
-  default:
-    return false;
-  }
-}
-
-// Classify by opcode, not by substring of the instruction's name.
-//
-// The previous name-matching version misfiled a lot of common code: XOR, OR,
-// AND and SLT matched no pattern at all and fell through to OpClass::Any,
-// which is lane-0 only, so any kernel built from logic ops was pinned to a
-// single lane. "SH" also matched store-halfword, and "ADD" matched AMOADD.
-// Anything genuinely unrecognised still lands on Any and stays in lane 0,
-// which is the safe direction.
-static OpClass classifyOpClass(const MachineInstr &MI,
-                               const RISCVInstrInfo &TII,
-                               bool PacketizeFP) {
-  (void)TII; // classification is now opcode-driven; no name lookup needed
-
-  // These predicates come from the instruction description and outrank any
-  // opcode guess.
-  if (MI.isBranch() || MI.isTerminator() || MI.isCall() || MI.isReturn())
-    return OpClass::Branch;
-  if (MI.mayLoad())
-    return OpClass::Load;
-  if (MI.mayStore())
-    return OpClass::Store;
-
-  // Floating point belongs in the worker lanes. wallypipelinedcore.sv
-  // instantiates fpu_1/fpu_2/fpu_3 beside the lane IEUs, backs them with
-  // fregfile_widened (four write ports), and routes each lane's FP-to-integer
-  // results -- FIntResM_n, FCvtIntResW_n, FIntDivResultW_n -- back into that
-  // lane's own IEU writeback, so fmv.x.w and fcvt.w.s are as legal as fadd.s.
-  // FP loads and stores are not covered here: mayLoad/mayStore above already
-  // claimed them for lane 0 along with the rest of the memory traffic.
-  if (touchesFPRegisters(MI))
-    return !PacketizeFP ? OpClass::Any
-                        : (isFPDivSqrtOpcode(MI.getOpcode())
-                               ? OpClass::FPUDivSqrt
-                               : OpClass::FPU);
-
-  switch (MI.getOpcode()) {
-  case RISCV::ADD:  case RISCV::ADDI:  case RISCV::SUB:
-  case RISCV::ADDW: case RISCV::ADDIW: case RISCV::SUBW:
-  case RISCV::C_ADD: case RISCV::C_ADDI: case RISCV::C_ADDI16SP:
-  case RISCV::C_ADDI4SPN: case RISCV::C_SUB:
-  case RISCV::C_ADDW: case RISCV::C_SUBW:
-    return OpClass::ALUAddSub;
-
-  case RISCV::MUL:  case RISCV::MULH: case RISCV::MULHU: case RISCV::MULHSU:
-  case RISCV::MULW:
-  case RISCV::DIV:  case RISCV::DIVU: case RISCV::DIVW:  case RISCV::DIVUW:
-  case RISCV::REM:  case RISCV::REMU: case RISCV::REMW:  case RISCV::REMUW:
-    return OpClass::ALUMulDiv;
-
-  case RISCV::SLL:  case RISCV::SLLI: case RISCV::SRL: case RISCV::SRLI:
-  case RISCV::SRA:  case RISCV::SRAI:
-  case RISCV::SLLW: case RISCV::SLLIW: case RISCV::SRLW: case RISCV::SRLIW:
-  case RISCV::SRAW: case RISCV::SRAIW:
-  case RISCV::C_SLLI: case RISCV::C_SRLI: case RISCV::C_SRAI:
-    return OpClass::ALUShift;
-
-  case RISCV::XOR: case RISCV::XORI: case RISCV::OR: case RISCV::ORI:
-  case RISCV::AND: case RISCV::ANDI:
-  case RISCV::C_XOR: case RISCV::C_OR: case RISCV::C_AND: case RISCV::C_ANDI:
-    return OpClass::ALULogic;
-
-  case RISCV::SLT: case RISCV::SLTI: case RISCV::SLTU: case RISCV::SLTIU:
-    return OpClass::Compare;
-
-  case RISCV::LUI: case RISCV::C_LUI: case RISCV::C_LI: case RISCV::C_MV:
-  case TargetOpcode::COPY:
-    return OpClass::Move;
-
-  case RISCV::CSRRW: case RISCV::CSRRS: case RISCV::CSRRC:
-  case RISCV::CSRRWI: case RISCV::CSRRSI: case RISCV::CSRRCI:
-    return OpClass::CSR;
-
-  default:
-    return OpClass::Any;
-  }
-}
-
 static Register getMemoryBaseReg(const MachineInstr &MI) {
   for (int I = static_cast<int>(MI.getNumOperands()) - 1; I >= 0; --I) {
     const MachineOperand &MO = MI.getOperand(I);
@@ -305,201 +201,6 @@ static Register getMemoryBaseReg(const MachineInstr &MI) {
 static bool isLikelyLSUOp(const MachineInstr &MI, const RISCVInstrInfo &TII) {
   (void)TII;
   return MI.mayLoad() || MI.mayStore();
-}
-
-// Bank is address bit 2. Both .bank0 and .bank1 start 8-byte aligned, so each
-// base has bit 2 clear. Bank1Skew of 4 moves .bank1 onto the other bank. A
-// constant offset flips the bank when its bit 2 is set. SP is 16-byte aligned,
-// so a frame slot plus a constant offset is bit 2 of that sum. Anything else
-// is unknown, and an unknown bank is the only memory operation in its packet.
-static std::optional<unsigned> bankFromSection(const GlobalValue &GV,
-                                               int64_t Disp,
-                                               unsigned Bank1Skew) {
-  StringRef Section = GV.getSection();
-  unsigned Bit = 0;
-  if (Section == ".bank0" || Section.starts_with(".bank0."))
-    Bit = 0;
-  else if (Section == ".bank1" || Section.starts_with(".bank1."))
-    Bit = (Bank1Skew >> 2) & 1u;
-  else
-    return std::nullopt;
-  return Bit ^ static_cast<unsigned>((Disp >> 2) & 1);
-}
-
-// The last definition of Reg in MBB before Before. A null Before searches from
-// the end of the block, including the last instruction.
-static const MachineInstr *findDefBefore(const MachineBasicBlock &MBB,
-                                         const MachineInstr *Before,
-                                         Register Reg) {
-  auto It = Before ? Before->getIterator() : MBB.end();
-  while (It != MBB.begin()) {
-    --It;
-    for (const MachineOperand &MO : It->operands())
-      if (MO.isReg() && MO.isDef() && MO.getReg() == Reg)
-        return &*It;
-  }
-  return nullptr;
-}
-
-// A phi whose latch value is addi or c.addi of the phi by a nonzero immediate.
-// Incoming is the value from the single predecessor outside the block.
-static bool phiPreheader(const MachineInstr &Phi, Register &Incoming,
-                         MachineBasicBlock *&Pred) {
-  if (!Phi.isPHI() || !Phi.getParent())
-    return false;
-  const MachineBasicBlock &Loop = *Phi.getParent();
-  Incoming = Register();
-  Pred = nullptr;
-  Register Latch;
-  bool SawLatch = false;
-  for (unsigned I = 1; I + 1 < Phi.getNumOperands(); I += 2) {
-    if (!Phi.getOperand(I).isReg() || !Phi.getOperand(I + 1).isMBB())
-      return false;
-    MachineBasicBlock *From = Phi.getOperand(I + 1).getMBB();
-    if (From == &Loop) {
-      if (SawLatch)
-        return false;
-      SawLatch = true;
-      Latch = Phi.getOperand(I).getReg();
-    } else {
-      if (Pred)
-        return false;
-      Pred = From;
-      Incoming = Phi.getOperand(I).getReg();
-    }
-  }
-  if (!Pred || !Incoming || !SawLatch || !Latch)
-    return false;
-  const Register PhiReg = Phi.getOperand(0).getReg();
-  const MachineInstr *Step = findDefBefore(Loop, nullptr, Latch);
-  if (!Step || Step == &Phi)
-    return false;
-  const unsigned Opc = Step->getOpcode();
-  Register Src;
-  int64_t Imm = 0;
-  if (Opc == RISCV::ADDI && Step->getNumOperands() >= 3 &&
-      Step->getOperand(1).isReg() && Step->getOperand(2).isImm()) {
-    Src = Step->getOperand(1).getReg();
-    Imm = Step->getOperand(2).getImm();
-  } else if (Opc == RISCV::C_ADDI && Step->getNumOperands() >= 2 &&
-             Step->getOperand(0).isReg() && Step->getOperand(1).isImm()) {
-    Src = Step->getOperand(0).getReg();
-    Imm = Step->getOperand(1).getImm();
-  } else {
-    return false;
-  }
-  // A step that sets address bit 2 changes the bank on every iteration, so
-  // this instruction has no single bank. A step of 8 bytes or more that
-  // leaves bit 2 alone keeps the preheader's bank.
-  return Imm != 0 && (Imm & 4) == 0 && Src == PhiReg;
-}
-
-static std::optional<unsigned> memoryBank(const MachineInstr &Start,
-                                          unsigned Bank1Skew) {
-  const MachineFunction *MF =
-      Start.getParent() ? Start.getParent()->getParent() : nullptr;
-  int64_t Disp = 0;
-  const GlobalValue *GV = nullptr;
-  bool SawFI = false;
-  for (const MachineOperand &MO : Start.operands()) {
-    if (MO.isImm())
-      Disp += MO.getImm();
-    else if (MO.isGlobal()) {
-      GV = MO.getGlobal();
-      Disp += MO.getOffset();
-    } else if (MO.isFI() && MF) {
-      Disp += MF->getFrameInfo().getObjectOffset(MO.getIndex());
-      SawFI = true;
-    }
-  }
-  if (GV)
-    return bankFromSection(*GV, Disp, Bank1Skew);
-  if (SawFI)
-    return static_cast<unsigned>((Disp >> 2) & 1);
-
-  if (!Start.getParent())
-    return std::nullopt;
-  Register Base = getMemoryBaseReg(Start);
-  const MachineInstr *Cursor = &Start;
-  const MachineBasicBlock *Block = Start.getParent();
-  for (unsigned Steps = 0; Steps < 6; ++Steps) {
-    if (!Base || !Block)
-      return std::nullopt;
-    if (Base == RISCV::X2)
-      return static_cast<unsigned>((Disp >> 2) & 1);
-    const MachineInstr *Def = findDefBefore(*Block, Cursor, Base);
-    if (!Def)
-      return std::nullopt;
-
-    if (Def->isPHI()) {
-      Register Incoming;
-      MachineBasicBlock *Pred = nullptr;
-      if (!phiPreheader(*Def, Incoming, Pred))
-        return std::nullopt;
-      // The step is the latch update. This iteration's address is the
-      // preheader value plus the displacement already accumulated.
-      Base = Incoming;
-      Cursor = nullptr;
-      Block = Pred;
-      continue;
-    }
-
-    const GlobalValue *DefGV = nullptr;
-    int64_t Add = 0;
-    bool SawImm = false;
-    Register Next;
-    for (const MachineOperand &MO : Def->operands()) {
-      if (MO.isGlobal()) {
-        DefGV = MO.getGlobal();
-        Add += MO.getOffset();
-      } else if (MO.isImm()) {
-        Add += MO.getImm();
-        SawImm = true;
-      } else if (MO.isReg() && MO.isUse() && !Next)
-        Next = MO.getReg();
-    }
-    const unsigned Opc = Def->getOpcode();
-    const bool IsAdd = Opc == RISCV::ADDI || Opc == RISCV::C_ADDI ||
-                       Opc == RISCV::C_ADDI16SP || Opc == RISCV::C_ADDI4SPN;
-    if (DefGV) {
-      Disp += Add;
-      return bankFromSection(*DefGV, Disp, Bank1Skew);
-    }
-    if (!IsAdd || !Next || !SawImm)
-      return std::nullopt;
-    Disp += Add;
-    Base = Next;
-    Cursor = Def;
-    Block = Def->getParent();
-  }
-  return std::nullopt;
-}
-
-// True when adding Cand, a memory operation, keeps the packet at one access
-// per bank and at most two memory operations.
-static bool memoryBanksAllow(ArrayRef<MachineInstr *> Members,
-                             const MachineInstr &Cand, unsigned Bank1Skew) {
-  std::optional<unsigned> Existing;
-  bool ExistingUnknown = false;
-  unsigned Count = 0;
-  for (const MachineInstr *MI : Members) {
-    if (!MI->mayLoad() && !MI->mayStore())
-      continue;
-    ++Count;
-    std::optional<unsigned> Bank = memoryBank(*MI, Bank1Skew);
-    if (!Bank)
-      ExistingUnknown = true;
-    else
-      Existing = Bank;
-  }
-  if (Count >= 2)
-    return false;
-  if (Count == 0)
-    return true;
-  std::optional<unsigned> CandBank = memoryBank(Cand, Bank1Skew);
-  if (ExistingUnknown || !CandBank || !Existing)
-    return false;
-  return *Existing != *CandBank;
 }
 
 // A predicated packet uses one register for every occupied lane. Opposite
@@ -787,7 +488,7 @@ static bool isPacketSafeToHint(
     ++It;
   }
 
-  std::optional<unsigned> SeenBank;
+  std::optional<MemBank> SeenBank;
   bool SeenUnknown = false;
   unsigned MemoryOps = 0;
   for (unsigned I = 0; I < Members.size(); ++I) {
@@ -796,13 +497,14 @@ static bool isPacketSafeToHint(
       ++MemoryOps;
       if (MemoryOps > 2)
         return false;
-      std::optional<unsigned> Bank = memoryBank(MI, Bank1Skew);
+      std::optional<MemBank> Bank = memoryBank(MI, Bank1Skew);
       if (!Bank) {
         // An unknown bank stays the only memory operation.
         if (MemoryOps > 1)
           return false;
         SeenUnknown = true;
-      } else if (SeenUnknown || (SeenBank && *SeenBank == *Bank)) {
+      } else if (SeenUnknown ||
+                 (SeenBank && !banksDifferEveryIteration(*SeenBank, *Bank))) {
         return false;
       } else {
         SeenBank = Bank;
@@ -1140,28 +842,14 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
     return NumChoices;
   };
 
+  // A stream pointer steps with addi. The LSU has no post-increment load, so
+  // that addi occupies a lane. Scoring it above a plain add keeps the step in
+  // the packet with the load it feeds. When the LSU grows a post-increment
+  // load, copy CORE-V XCVmem: ISel already lowers ISD::POST_INC to cv.l*.inc,
+  // and getPreferredAddressingMode returns AMK_PostIndexed so loop strength
+  // reduction produces that form. The decoder does not accept cv.l* today.
   auto isLikelyPointerBump = [&](const MachineInstr &MI) {
-    if (!Config.Scheduler.PrioritizePointerBumps)
-      return false;
-    const StringRef Name = TII->getName(MI.getOpcode());
-    if (!Name.contains("ADDI"))
-      return false;
-
-    Register DefReg;
-    Register UseReg;
-    bool HasImm = false;
-    int64_t Imm = 0;
-    for (const MachineOperand &MO : MI.operands()) {
-      if (MO.isReg() && MO.isDef() && !DefReg)
-        DefReg = MO.getReg();
-      if (MO.isReg() && MO.isUse() && !UseReg)
-        UseReg = MO.getReg();
-      if (MO.isImm()) {
-        HasImm = true;
-        Imm = MO.getImm();
-      }
-    }
-    return DefReg && UseReg && DefReg == UseReg && HasImm && Imm != 0;
+    return Config.Scheduler.PrioritizePointerBumps && isPointerBump(MI);
   };
 
   auto abandonPacket = [&]() {
@@ -1443,7 +1131,7 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
         continue;
 
       const OpClass CandClass =
-          classifyOpClass(*It, *TII, Config.Scheduler.PacketizeFP);
+          classifyOpClass(*It, Config.Scheduler.PacketizeFP);
       const int CandLane = tryAssignLaneWithUsed(CandClass, SimLanes);
       if (CandLane < 0)
         continue;
@@ -1481,7 +1169,7 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
       ++Seen;
       if (PrevDefs.empty())
         continue;
-      if (classifyOpClass(*It, *TII, Config.Scheduler.PacketizeFP) !=
+      if (classifyOpClass(*It, Config.Scheduler.PacketizeFP) !=
           ProducerClass)
         continue;
       for (Register Reg : PrevDefs) {
@@ -1633,7 +1321,7 @@ bool StarbugVLIWPacketizer::packetizeBasicBlock(MachineBasicBlock &MBB,
         continue;
 
       OpClass CandClass =
-          classifyOpClass(*CandIt, *TII, Config.Scheduler.PacketizeFP);
+          classifyOpClass(*CandIt, Config.Scheduler.PacketizeFP);
       int CandLane = tryAssignLane(CandClass);
       if (CandLane < 0)
         continue;

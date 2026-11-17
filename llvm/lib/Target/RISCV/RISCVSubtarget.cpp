@@ -19,11 +19,17 @@
 #include "RISCVTargetMachine.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/MC/TargetRegistry.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ErrorHandling.h"
 
 using namespace llvm;
 
 #define DEBUG_TYPE "riscv-subtarget"
+
+static cl::opt<unsigned> StarbugVLIWSchedRegionLimit(
+    "starbug-vliw-sched-region-limit", cl::Hidden, cl::init(64),
+    cl::desc("Max non-debug instructions in one Starbug pre-RA scheduling "
+             "region (0 = no cap)"));
 
 #define GET_SUBTARGETINFO_TARGET_DESC
 #define GET_SUBTARGETINFO_CTOR
@@ -99,6 +105,18 @@ RISCVSubtarget::initializeSubtargetDependencies(const Triple &TT, StringRef CPU,
   assert(TuneInfo && "TuneInfo shouldn't be nullptr!");
 
   ParseSubtargetFeatures(CPU, TuneCPU, FS);
+
+  // A Starbug packet counts the bytes that follow its header. Linker
+  // relaxation deletes bytes after this object is written, so the relax
+  // feature is cleared even when the IR still asks for it.
+  if (hasFeature(RISCV::FeatureStarbugVLIW)) {
+    FeatureBitset Bits = getFeatureBits();
+    if (Bits[RISCV::FeatureRelax]) {
+      Bits.reset(RISCV::FeatureRelax);
+      setFeatureBits(Bits);
+    }
+    EnableLinkerRelax = false;
+  }
 
   RISCV::updateCZceFeatureImplications(*this);
 
@@ -287,6 +305,12 @@ void RISCVSubtarget::overridePostRASchedPolicy(
     Policy.OnlyTopDown = false;
     Policy.OnlyBottomUp = false;
   }
+}
+
+unsigned RISCVSubtarget::getMachineSchedRegionLimit() const {
+  if (!hasStarbugVLIW())
+    return 0;
+  return StarbugVLIWSchedRegionLimit;
 }
 
 bool RISCVSubtarget::useMIPSLoadStorePairs() const {
