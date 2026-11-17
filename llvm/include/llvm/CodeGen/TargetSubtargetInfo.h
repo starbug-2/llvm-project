@@ -255,6 +255,12 @@ public:
   virtual void overridePostRASchedPolicy(MachineSchedPolicy &Policy,
                                          const SchedRegion &Region) const {}
 
+  /// Maximum number of non-debug, non-pseudo instructions in one
+  /// machine-scheduling region. 0 means do not split regions for size.
+  /// A cap keeps a quadratic list scheduler off a single huge block.
+  /// Instructions cannot move across the split.
+  virtual unsigned getMachineSchedRegionLimit() const { return 0; }
+
   // Perform target-specific adjustments to the latency of a schedule
   // dependency.
   // If a pair of operands is associated with the schedule dependency, DefOpIdx

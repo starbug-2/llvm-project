@@ -778,16 +778,22 @@ getSchedRegions(MachineBasicBlock *MBB,
                 bool RegionsTopDown) {
   MachineFunction *MF = MBB->getParent();
   const TargetInstrInfo *TII = MF->getSubtarget().getInstrInfo();
+  // 0 keeps the historical behavior: regions end only at scheduling
+  // boundaries. A positive cap splits a large block so pickNode stays
+  // bounded. The cut is not itself a boundary, and both pieces are scheduled.
+  const unsigned RegionLimit = MF->getSubtarget().getMachineSchedRegionLimit();
 
   MachineBasicBlock::iterator I = nullptr;
   for(MachineBasicBlock::iterator RegionEnd = MBB->end();
       RegionEnd != MBB->begin(); RegionEnd = I) {
 
-    // Avoid decrementing RegionEnd for blocks with no terminator.
-    if (RegionEnd != MBB->end() ||
-        isSchedBoundary(&*std::prev(RegionEnd), &*MBB, MF, TII)) {
+    // Step back onto a real scheduling boundary so the DAG excludes it.
+    // When the previous region ended because of RegionLimit, RegionEnd is
+    // the first instruction of that region. That instruction is not a
+    // boundary and already belongs to the region below, so leave it there.
+    if (RegionEnd != MBB->begin() &&
+        isSchedBoundary(&*std::prev(RegionEnd), &*MBB, MF, TII))
       --RegionEnd;
-    }
 
     // The next region starts above the previous region. Look backward in the
     // instruction stream until we find the nearest boundary.
@@ -800,6 +806,8 @@ getSchedRegions(MachineBasicBlock *MBB,
       if (!MI.isDebugOrPseudoInstr()) {
         // MBB::size() uses instr_iterator to count. Here we need a bundle to
         // count as a single instruction.
+        if (RegionLimit && NumRegionInstrs >= RegionLimit)
+          break;
         ++NumRegionInstrs;
       }
     }

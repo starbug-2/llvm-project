@@ -66,18 +66,18 @@ VLIWResourceModel::VLIWResourceModel(const TargetSubtargetInfo &STI,
     : TII(STI.getInstrInfo()), SchedModel(SM) {
   ResourcesModel = createPacketizer(STI);
 
-  // This hard requirement could be relaxed,
-  // but for now do not let it proceed.
-  assert(ResourcesModel && "Unimplemented CreateTargetScheduleState.");
-
+  // A target with no instruction itinerary has no DFA. Subclasses then track
+  // issue resources themselves. Hexagon still supplies a packetizer.
   Packet.reserve(SchedModel->getIssueWidth());
   Packet.clear();
-  ResourcesModel->clearResources();
+  if (ResourcesModel)
+    ResourcesModel->clearResources();
 }
 
 void VLIWResourceModel::reset() {
   Packet.clear();
-  ResourcesModel->clearResources();
+  if (ResourcesModel)
+    ResourcesModel->clearResources();
 }
 
 VLIWResourceModel::~VLIWResourceModel() { delete ResourcesModel; }
@@ -112,7 +112,8 @@ bool VLIWResourceModel::isResourceAvailable(SUnit *SU, bool IsTop) {
   // in the current cycle.
   switch (SU->getInstr()->getOpcode()) {
   default:
-    if (!ResourcesModel->canReserveResources(*SU->getInstr()))
+    if (ResourcesModel &&
+        !ResourcesModel->canReserveResources(*SU->getInstr()))
       return false;
     break;
   case TargetOpcode::EXTRACT_SUBREG:
@@ -160,7 +161,8 @@ bool VLIWResourceModel::reserveResources(SUnit *SU, bool IsTop) {
 
   switch (SU->getInstr()->getOpcode()) {
   default:
-    ResourcesModel->reserveResources(*SU->getInstr());
+    if (ResourcesModel)
+      ResourcesModel->reserveResources(*SU->getInstr());
     break;
   case TargetOpcode::EXTRACT_SUBREG:
   case TargetOpcode::INSERT_SUBREG:
@@ -704,7 +706,10 @@ int ConvergingVLIWScheduler::SchedulingCost(ReadyQueue &Q, SUnit *SU,
   // instruction is in the current packet.
   if (Q.getID() == TopQID && getWeakLeft(SU, true) == 0) {
     for (const SDep &PI : SU->Preds) {
-      if (!PI.getSUnit()->getInstr()->isPseudo() && PI.isAssignedRegDep() &&
+      // Entry/Exit nodes have no instruction. A boundary predecessor is not a
+      // zero-latency instruction sitting in the current packet.
+      const MachineInstr *PredMI = PI.getSUnit()->getInstr();
+      if (PredMI && !PredMI->isPseudo() && PI.isAssignedRegDep() &&
           PI.getLatency() == 0 &&
           Top.ResourceModel->isInPacket(PI.getSUnit())) {
         ResCount += PriorityThree;
@@ -713,7 +718,8 @@ int ConvergingVLIWScheduler::SchedulingCost(ReadyQueue &Q, SUnit *SU,
     }
   } else if (Q.getID() == BotQID && getWeakLeft(SU, false) == 0) {
     for (const SDep &SI : SU->Succs) {
-      if (!SI.getSUnit()->getInstr()->isPseudo() && SI.isAssignedRegDep() &&
+      const MachineInstr *SuccMI = SI.getSUnit()->getInstr();
+      if (SuccMI && !SuccMI->isPseudo() && SI.isAssignedRegDep() &&
           SI.getLatency() == 0 &&
           Bot.ResourceModel->isInPacket(SI.getSUnit())) {
         ResCount += PriorityThree;
