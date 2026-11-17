@@ -2790,13 +2790,25 @@ static void RenderFloatingPointOptions(const ToolChain &TC, const Driver &D,
 
   // CUDA and HIP don't rely on the frontend to pass an ffp-contract option.
   // If one wasn't given by the user, don't pass it here.
+  //
+  // Starbug's FPU implements fmadd, and stock RISC-V ISel already selects it
+  // from a contracted fmul+fadd. The default "on" only contracts inside one
+  // source statement. DSP builds want the multiply and a later add in the
+  // same function to become one fmadd, which is -ffp-contract=fast. An
+  // explicit -ffp-contract= or -ffp-model= still replaces this default.
+  const bool StarbugVLIW = [&] {
+    if (const Arg *A = Args.getLastArg(options::OPT_mcpu_EQ))
+      return StringRef(A->getValue()) == "starbug-vliw";
+    return false;
+  }();
+  const StringRef FPContractDefault = StarbugVLIW ? "fast" : "on";
   StringRef FPContract;
   StringRef LastSeenFfpContractOption;
   StringRef LastFpContractOverrideOption;
   bool SeenUnsafeMathModeOption = false;
   if (!JA.isDeviceOffloading(Action::OFK_Cuda) &&
       !JA.isOffloading(Action::OFK_HIP))
-    FPContract = "on";
+    FPContract = FPContractDefault;
   bool StrictFPModel = false;
   StringRef Float16ExcessPrecision = "";
   StringRef BFloat16ExcessPrecision = "";
@@ -2836,15 +2848,16 @@ static void RenderFloatingPointOptions(const ToolChain &TC, const Driver &D,
     // For other targets, if the state has been changed by one of the
     // unsafe-math umbrella options a subsequent -fno-fast-math or
     // -fno-unsafe-math-optimizations option reverts to the last value seen for
-    // the -ffp-contract option or "on" if we have not seen the -ffp-contract
-    // option. If we have not seen an unsafe-math option or -ffp-contract,
-    // we leave the FPContract state unchanged.
+    // the -ffp-contract option or the target default ("fast" on Starbug,
+    // "on" elsewhere) if we have not seen the -ffp-contract option. If we
+    // have not seen an unsafe-math option or -ffp-contract, we leave the
+    // FPContract state unchanged.
     if (!JA.isDeviceOffloading(Action::OFK_Cuda) &&
         !JA.isOffloading(Action::OFK_HIP)) {
       if (LastSeenFfpContractOption != "")
         FPContract = LastSeenFfpContractOption;
       else if (SeenUnsafeMathModeOption)
-        FPContract = "on";
+        FPContract = FPContractDefault;
     }
     // In this case, we're reverting to the last explicit fp-contract option
     // or the platform default

@@ -21,6 +21,7 @@
 #include "clang/Options/Options.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Option/ArgList.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/VirtualFileSystem.h"
 
@@ -134,8 +135,22 @@ static std::string computeClangRuntimesSysRoot(const Driver &D,
 // whether the GCC toolchain was initialized successfully.
 bool BareMetal::initGCCInstallation(const llvm::Triple &Triple,
                                     const llvm::opt::ArgList &Args) {
-  if (Args.getLastArg(options::OPT_gcc_toolchain) ||
-      Args.getLastArg(clang::options::OPT_gcc_install_dir_EQ)) {
+  const bool Explicit =
+      Args.getLastArg(options::OPT_gcc_toolchain) ||
+      Args.getLastArg(clang::options::OPT_gcc_install_dir_EQ);
+  // --sysroot=<toolchain>/riscv-none-elf is the xPack layout. GCC lives in
+  // the parent, so a sysroot alone is enough to select that install.
+  bool XPackSysroot = false;
+  if (!Explicit && Triple.isRISCV() && !getDriver().SysRoot.empty()) {
+    SmallString<128> Parent(getDriver().SysRoot);
+    while (!Parent.empty() && llvm::sys::path::is_separator(Parent.back()))
+      Parent.pop_back();
+    llvm::sys::path::remove_filename(Parent);
+    SmallString<128> Marker(Parent);
+    llvm::sys::path::append(Marker, "lib", "gcc", "riscv-none-elf");
+    XPackSysroot = !Parent.empty() && getDriver().getVFS().exists(Marker);
+  }
+  if (Explicit || XPackSysroot) {
     GCCInstallation.init(Triple, Args);
     return GCCInstallation.isValid();
   }
@@ -256,6 +271,27 @@ BareMetal::BareMetal(const Driver &D, const llvm::Triple &Triple,
       }
     }
   }
+
+  // xPack and riscv-gnu-toolchain install the linker as riscv-none-elf-ld.
+  // The program-path list already contains <toolchain>/bin when the gcc
+  // install above was found. Do not search PATH: an unrelated machine
+  // should keep the generic "ld" name.
+  if (Triple.isRISCV()) {
+    for (const auto &Path : getProgramPaths()) {
+      SmallString<128> Ld(Path);
+      llvm::sys::path::append(Ld, "riscv-none-elf-ld");
+      if (llvm::sys::fs::can_execute(Ld)) {
+        RISCVLdPath = std::string(Ld);
+        break;
+      }
+    }
+  }
+}
+
+const char *BareMetal::getDefaultLinker() const {
+  if (!RISCVLdPath.empty())
+    return RISCVLdPath.c_str();
+  return ToolChain::getDefaultLinker();
 }
 
 static void
@@ -594,6 +630,31 @@ void baremetal::StaticLibTool::ConstructJob(Compilation &C, const JobAction &JA,
                                          Exec, CmdArgs, Inputs, Output));
 }
 
+static bool isStarbugVLIWCPU(const ArgList &Args) {
+  const Arg *A = Args.getLastArg(options::OPT_mcpu_EQ);
+  return A && StringRef(A->getValue()) == "starbug-vliw";
+}
+
+// The Starbug simulator maps RAM at 0x80000000 and word-interleaves two
+// banks on address bit 2. The script is the resource file include/starbug-vliw.ld.
+// A user -T replaces it. -r is a relocatable link and does not take a layout.
+static void addStarbugLinkerScript(const ToolChain &TC, const ArgList &Args,
+                                   ArgStringList &CmdArgs) {
+  if (!isStarbugVLIWCPU(Args) || Args.hasArg(options::OPT_T) ||
+      Args.hasArg(options::OPT_r))
+    return;
+
+  const Driver &D = TC.getDriver();
+  SmallString<128> Script(D.ResourceDir);
+  llvm::sys::path::append(Script, "include", "starbug-vliw.ld");
+  if (!llvm::sys::fs::exists(Script)) {
+    D.Diag(diag::err_drv_no_such_file) << Script;
+    return;
+  }
+  CmdArgs.push_back("-T");
+  CmdArgs.push_back(Args.MakeArgString(Script));
+}
+
 void baremetal::Linker::ConstructJob(Compilation &C, const JobAction &JA,
                                      const InputInfo &Output,
                                      const InputInfoList &Inputs,
@@ -672,6 +733,8 @@ void baremetal::Linker::ConstructJob(Compilation &C, const JobAction &JA,
     }
   }
 
+  addStarbugLinkerScript(getToolChain(), Args, CmdArgs);
+
   Args.addAllArgs(CmdArgs,
                   {options::OPT_L, options::OPT_u, options::OPT_T_Group,
                    options::OPT_s, options::OPT_t, options::OPT_r});
@@ -703,7 +766,13 @@ void baremetal::Linker::ConstructJob(Compilation &C, const JobAction &JA,
     AddRunTimeLibs(TC, D, CmdArgs, Args);
     if (!Args.hasArg(options::OPT_nolibc))
       CmdArgs.push_back("-lc");
-    if (TC.hasValidGCCInstallation() || detectGCCToolchainAdjacent(D))
+    // semihost.specs replaces -lgloss with -lsemihost. The Starbug
+    // simulator serves printf through the semihosting stubs. Newlib
+    // itself may still be relaxed by the linker; Starbug objects are
+    // compiled with -relax so their packets have no R_RISCV_RELAX.
+    if (isStarbugVLIWCPU(Args))
+      CmdArgs.push_back("-lsemihost");
+    else if (TC.hasValidGCCInstallation() || detectGCCToolchainAdjacent(D))
       CmdArgs.push_back("-lgloss");
     CmdArgs.push_back("--end-group");
   }

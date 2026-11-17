@@ -2157,6 +2157,20 @@ void Generic_GCC::GCCInstallationDetector::init(
     // If we have a SysRoot, try that first.
     if (!D.SysRoot.empty()) {
       Prefixes.push_back(D.SysRoot);
+      // xPack lays out <toolchain>/riscv-none-elf as the sysroot and
+      // <toolchain>/lib/gcc/riscv-none-elf as the gcc libraries. A
+      // --sysroot pointing at the former should still find the latter.
+      if (TargetTriple.isRISCV()) {
+        SmallString<128> Parent(D.SysRoot);
+        while (!Parent.empty() &&
+               llvm::sys::path::is_separator(Parent.back()))
+          Parent.pop_back();
+        llvm::sys::path::remove_filename(Parent);
+        SmallString<128> Marker(Parent);
+        llvm::sys::path::append(Marker, "lib", "gcc", "riscv-none-elf");
+        if (!Parent.empty() && D.getVFS().exists(Marker))
+          Prefixes.push_back(std::string(Parent));
+      }
       AddDefaultGCCPrefixes(TargetTriple, Prefixes, D.SysRoot);
     }
 
@@ -2435,11 +2449,15 @@ void Generic_GCC::GCCInstallationDetector::AddDefaultGCCPrefixes(
       "powerpc64le-suse-linux", "ppc64le-redhat-linux"};
 
   static const char *const RISCV32LibDirs[] = {"/lib32", "/lib"};
+  // riscv-none-elf is the triple used by the xPack and riscv-gnu-toolchain
+  // multilib compilers (one gcc, both XLENs).
   static const char *const RISCV32Triples[] = {"riscv32-unknown-linux-gnu",
-                                               "riscv32-unknown-elf"};
+                                               "riscv32-unknown-elf",
+                                               "riscv-none-elf"};
   static const char *const RISCV64LibDirs[] = {"/lib64", "/lib"};
   static const char *const RISCV64Triples[] = {"riscv64-unknown-linux-gnu",
-                                               "riscv64-unknown-elf"};
+                                               "riscv64-unknown-elf",
+                                               "riscv-none-elf"};
 
   static const char *const RISCV32beLibDirs[] = {"/lib32", "/lib"};
   static const char *const RISCV32beTriples[] = {"riscv32be-unknown-linux-gnu",

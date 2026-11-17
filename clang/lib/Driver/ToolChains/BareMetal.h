@@ -48,6 +48,7 @@ public:
   }
   bool isPICDefaultForced() const override { return false; }
   bool SupportsProfiling() const override { return false; }
+  const char *getDefaultLinker() const override;
 
   StringRef getOSLibName() const override { return "baremetal"; }
 
@@ -90,6 +91,10 @@ private:
   std::string SysRoot;
 
   bool IsGCCInstallationValid;
+
+  // Absolute path of riscv-none-elf-ld when the sysroot's toolchain ships
+  // one. Empty means the generic "ld" lookup.
+  std::string RISCVLdPath;
 
   SmallVector<std::string> MultilibMacroDefines;
 };

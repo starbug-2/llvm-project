@@ -75,6 +75,11 @@ void riscv::getRISCVTargetFeatures(const Driver &D, const llvm::Triple &Triple,
 
   bool CPUFastScalarUnaligned = false;
   bool CPUFastVectorUnaligned = false;
+  // Starbug packets count the bytes that follow the header. Linker
+  // relaxation rewrites those bytes after assembly, so this CPU defaults
+  // to -mno-relax. The march string cannot name +starbug-vliw (it is not
+  // an ISA extension), so the feature is added explicitly.
+  bool IsStarbugVLIW = false;
 
   // If users give march and mcpu, get std extension feature from MArch
   // and other features (ex. mirco architecture feature) from mcpu
@@ -85,6 +90,9 @@ void riscv::getRISCVTargetFeatures(const Driver &D, const llvm::Triple &Triple,
 
     if (!isValidRISCVCPU(D, A, Triple, CPU))
       return;
+
+    if (CPU == "starbug-vliw")
+      IsStarbugVLIW = true;
 
     if (llvm::RISCV::hasFastScalarUnalignedAccess(CPU))
       CPUFastScalarUnaligned = true;
@@ -129,8 +137,16 @@ void riscv::getRISCVTargetFeatures(const Driver &D, const llvm::Triple &Triple,
   RESERVE_REG(x31)
 #undef RESERVE_REG
 
-  // -mrelax is default, unless -mno-relax is specified.
-  if (Args.hasFlag(options::OPT_mrelax, options::OPT_mno_relax, true))
+  // -mrelax is default, unless -mno-relax is specified. Starbug cannot
+  // relax: -mrelax is rejected and the feature is forced off.
+  if (IsStarbugVLIW && Args.hasArg(options::OPT_mrelax)) {
+    D.Diag(diag::err_drv_unsupported_opt_for_target)
+        << "-mrelax" << "starbug-vliw";
+  }
+  if (IsStarbugVLIW)
+    Features.push_back("+starbug-vliw");
+  if (!IsStarbugVLIW &&
+      Args.hasFlag(options::OPT_mrelax, options::OPT_mno_relax, true))
     Features.push_back("+relax");
   else
     Features.push_back("-relax");
