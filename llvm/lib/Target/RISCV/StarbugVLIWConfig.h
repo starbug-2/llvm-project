@@ -35,17 +35,57 @@ struct LaneConfig {
 };
 
 struct UnrollPolicy {
-  bool ForceUnroll = true;
-  unsigned DefaultUnrollFactor = 64;
-  unsigned MaxUnrollFactor = 512;
-  unsigned Threshold = 100000;
-  unsigned PartialThreshold = 100000;
-  unsigned MaxPercentThresholdBoost = 1000;
-  unsigned UnrollAndJamInnerLoopThreshold = 100000;
-  unsigned SCEVExpansionBudget = 4096;
-  bool PreferUnrollAndJam = true;
+  // 0 means "derive a factor from the loop and the machine". A non-zero
+  // value is an explicit override (-starbug-vliw-unroll-factor) and is still
+  // clipped by the spill and I-cache guards.
+  bool ForceUnroll = false;
+  unsigned DefaultUnrollFactor = 0;
+  unsigned MaxUnrollFactor = 8;
+  // Unrolled body, in instructions. Kept under the pipeliner's MII cap
+  // (pipeliner-max-mii is 27; 64 instructions is an MII of 8 on this machine)
+  // and small enough to stay in the I-cache.
+  unsigned ICacheBudget = 64;
+  // Allocatable registers after a 3/4 headroom. Each unrolled copy is charged
+  // for the values it produces, because the modulo scheduler overlaps them.
+  unsigned IntRegBudget = 18;
+  unsigned FPRegBudget = 18;
+  unsigned Threshold = 64;
+  unsigned PartialThreshold = 64;
+  unsigned MaxPercentThresholdBoost = 100;
+  unsigned UnrollAndJamInnerLoopThreshold = 60;
+  unsigned SCEVExpansionBudget = 256;
+  bool PreferUnrollAndJam = false;
   bool SpillPressureGuard = true;
 };
+
+// What one loop looks like to the unroll heuristic. Latencies on this machine
+// are one cycle (a packet reads at the start and writes at the end), so a
+// carried chain's latency is its instruction count.
+struct PipelineUnrollShape {
+  unsigned BodyInsts = 0;
+  unsigned IndependentInsts = 0;
+  unsigned CarriedLat = 1;
+  unsigned LiveInt = 0;
+  unsigned LiveFP = 0;
+  bool PipelinerCandidate = false;
+};
+
+struct PipelineUnrollBudget {
+  unsigned IssueWidth = 8;
+  unsigned HardMax = 8;
+  unsigned ExplicitFactor = 0;
+  unsigned ICacheInsts = 64;
+  unsigned IntBudget = 18;
+  unsigned FPBudget = 18;
+  bool SpillGuard = true;
+};
+
+// Unroll a pipelined loop only far enough to cover its loop-carried chain,
+// and only while the copies still fit in the register file. The machine
+// pipeliner overlaps the next iteration; a larger factor grows the kernel's
+// MII and the I-cache footprint instead of exposing more ILP.
+unsigned computePipelineUnrollFactor(const PipelineUnrollShape &Shape,
+                                    const PipelineUnrollBudget &Budget);
 
 struct SchedulerPolicy {
   bool PrioritizePointerBumps = true;

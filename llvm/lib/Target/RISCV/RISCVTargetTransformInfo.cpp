@@ -10,6 +10,7 @@
 #include "MCTargetDesc/RISCVMatInt.h"
 #include "StarbugVLIWConfig.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/CodeGen/BasicTTIImpl.h"
 #include "llvm/CodeGen/CostTable.h"
@@ -2805,107 +2806,127 @@ InstructionCost RISCVTTIImpl::getPointersChainCost(
   return Cost;
 }
 
+// Instructions on a path from the latch value back to the phi. The depth of
+// that path is the carried-chain length. Unit latency makes that the RecMII
+// contribution of the phi.
+static unsigned markCarriedChain(const Loop *L, PHINode &PN,
+                                 SmallPtrSetImpl<Instruction *> &OnChain) {
+  BasicBlock *Latch = L->getLoopLatch();
+  if (!Latch)
+    return 1;
+
+  struct Walker {
+    const Loop *L;
+    PHINode *PN;
+    SmallPtrSetImpl<Instruction *> &OnChain;
+    SmallPtrSet<Instruction *, 16> Stack;
+    unsigned Best = 0;
+
+    bool walk(Value *V, unsigned Depth) {
+      if (V == PN) {
+        Best = std::max(Best, Depth);
+        return true;
+      }
+      auto *I = dyn_cast<Instruction>(V);
+      if (!I || !L->contains(I) || Depth > 16 || !Stack.insert(I).second)
+        return false;
+      bool Reaches = false;
+      for (Value *Op : I->operands())
+        Reaches |= walk(Op, Depth + 1);
+      if (Reaches)
+        OnChain.insert(I);
+      Stack.erase(I);
+      return Reaches;
+    }
+  };
+
+  Walker W{L, &PN, OnChain, {}, 0};
+  W.walk(PN.getIncomingValueForBlock(Latch), 0);
+  return W.Best == 0 ? 1 : W.Best;
+}
+
+static RISCVVLIW::PipelineUnrollShape starbugUnrollShape(const Loop *L) {
+  RISCVVLIW::PipelineUnrollShape Shape;
+  const bool OneBlock = L->isInnermost() && L->getNumBlocks() == 1 &&
+                        L->getExitingBlock();
+  bool HasCall = false;
+  SmallPtrSet<Instruction *, 16> OnChain;
+  unsigned Longest = 1;
+  for (BasicBlock *BB : L->getBlocks()) {
+    for (Instruction &I : *BB) {
+      if (I.isDebugOrPseudoInst())
+        continue;
+      if (I.getType()->isIntegerTy())
+        ++Shape.LiveInt;
+      else if (I.getType()->isFloatingPointTy())
+        ++Shape.LiveFP;
+      if (isa<PHINode>(I) || I.isTerminator())
+        continue;
+      ++Shape.BodyInsts;
+      if (isa<CallBase>(I) && !isa<IntrinsicInst>(I))
+        HasCall = true;
+    }
+    if (OneBlock) {
+      for (PHINode &PN : BB->phis())
+        Longest = std::max(Longest, markCarriedChain(L, PN, OnChain));
+    }
+  }
+  Shape.CarriedLat = Longest;
+  unsigned Indep = Shape.BodyInsts;
+  for (Instruction *I : OnChain) {
+    if (isa<PHINode>(I) || I->isTerminator() || Indep == 0)
+      continue;
+    --Indep;
+  }
+  Shape.IndependentInsts = Indep;
+  // The machine pipeliner wants a single-block loop with no call. Anything
+  // else is packed only inside the block, so a few copies can fill the lanes.
+  Shape.PipelinerCandidate = OneBlock && !HasCall && Shape.BodyInsts <= 64;
+  return Shape;
+}
+
 void RISCVTTIImpl::getUnrollingPreferences(
     Loop *L, ScalarEvolution &SE, TTI::UnrollingPreferences &UP,
     OptimizationRemarkEmitter *ORE) const {
   if (ST->hasStarbugVLIW()) {
     const auto Cfg = RISCVVLIW::StarbugVLIWConfig::fromCommandLine();
-    const SCEV *BackedgeCount = SE.getBackedgeTakenCount(L);
-    const auto *ConstBackedgeCount = dyn_cast<SCEVConstant>(BackedgeCount);
-    const bool HasConstTripCount = ConstBackedgeCount &&
-                                   !ConstBackedgeCount->getAPInt().isNegative();
+    const RISCVVLIW::PipelineUnrollShape Shape = starbugUnrollShape(L);
+    RISCVVLIW::PipelineUnrollBudget Budget;
+    Budget.IssueWidth = std::max(1u, Cfg.NumLanes);
+    Budget.HardMax = Cfg.Unroll.MaxUnrollFactor;
+    Budget.ExplicitFactor = Cfg.Unroll.DefaultUnrollFactor;
+    Budget.ICacheInsts = Cfg.Unroll.ICacheBudget;
+    Budget.IntBudget = Cfg.Unroll.IntRegBudget;
+    Budget.FPBudget = Cfg.Unroll.FPRegBudget;
+    Budget.SpillGuard = Cfg.Unroll.SpillPressureGuard;
+    const unsigned UF =
+        RISCVVLIW::computePipelineUnrollFactor(Shape, Budget);
 
-    uint64_t ConstTripCount = 0;
-    if (HasConstTripCount) {
-      const APInt TripCountAP = ConstBackedgeCount->getAPInt() + 1;
-      ConstTripCount =
-          TripCountAP.getLimitedValue(std::numeric_limits<uint64_t>::max());
-    }
-
-    SmallVector<BasicBlock *, 4> ExitingBlocks;
-    L->getExitingBlocks(ExitingBlocks);
-    const bool HasSimpleCFG = ExitingBlocks.size() <= 2 && L->getNumBlocks() <= 4;
-
-    bool HasVectorOps = false;
-    bool HasLoweredCalls = false;
-    const bool IsVectorized = getBooleanLoopAttribute(L, "llvm.loop.isvectorized");
-    for (auto *BB : L->getBlocks()) {
-      for (auto &I : *BB) {
-        if (IsVectorized &&
-            (I.getType()->isVectorTy() ||
-             llvm::any_of(I.operand_values(),
-                          [](Value *V) { return V->getType()->isVectorTy(); }))) {
-          HasVectorOps = true;
-          break;
-        }
-
-        if (isa<CallInst>(I) || isa<InvokeInst>(I)) {
-          if (const Function *F = cast<CallBase>(I).getCalledFunction()) {
-            if (!isLoweredToCall(F))
-              continue;
-          }
-          HasLoweredCalls = true;
-          break;
-        }
-      }
-      if (HasVectorOps || HasLoweredCalls)
-        break;
-    }
-
-    const bool EnableAggressiveConstUnroll =
-        HasConstTripCount && ConstTripCount > 0 && HasSimpleCFG &&
-        !HasLoweredCalls && !HasVectorOps;
-
-    // Safety guard: keep runtime-trip loops on conservative defaults.
-    // Starbug's aggressive runtime unroll settings can produce wrong-code
-    // on some RV32 loops (observed as bad pointer materialization).
-    //
-    // Also avoid forcing Starbug's aggressive knobs on call-heavy/control-flow
-    // loops (e.g. outer driver loops that call kernels), which are
-    // particularly brittle with large forced-unroll settings.
-    if (EnableAggressiveConstUnroll) {
-      UP.Threshold = std::max(UP.Threshold, Cfg.Unroll.Threshold);
-      UP.PartialThreshold =
-          std::max(UP.PartialThreshold, Cfg.Unroll.PartialThreshold);
-      UP.MaxPercentThresholdBoost = std::max(
-          UP.MaxPercentThresholdBoost, Cfg.Unroll.MaxPercentThresholdBoost);
-      UP.DefaultUnrollRuntimeCount = Cfg.Unroll.DefaultUnrollFactor;
-      UP.MaxCount = std::max(UP.MaxCount, Cfg.Unroll.MaxUnrollFactor);
-      UP.MaxUpperBound = std::max(UP.MaxUpperBound, Cfg.Unroll.MaxUnrollFactor);
-      UP.FullUnrollMaxCount =
-          std::max(UP.FullUnrollMaxCount, Cfg.Unroll.MaxUnrollFactor);
-      UP.MaxIterationsCountToAnalyze =
-          std::max(UP.MaxIterationsCountToAnalyze, Cfg.Unroll.MaxUnrollFactor);
-    }
-
-    UP.OptSizeThreshold = std::numeric_limits<unsigned>::max();
-    UP.PartialOptSizeThreshold = std::numeric_limits<unsigned>::max();
-
+    // Size the unrolled body to the I-cache budget. Do not lift the ceiling
+    // to hundreds of copies: the pipeliner refuses a kernel whose MII exceeds
+    // its cap, and a huge body evicts the loop from the I-cache.
+    UP.Threshold = Cfg.Unroll.ICacheBudget;
+    UP.PartialThreshold = Cfg.Unroll.ICacheBudget;
+    UP.MaxPercentThresholdBoost = Cfg.Unroll.MaxPercentThresholdBoost;
+    UP.Count = UF;
+    UP.DefaultUnrollRuntimeCount = UF;
+    UP.MaxCount = std::max(UF, Cfg.Unroll.MaxUnrollFactor);
+    // Small constant trips may still disappear entirely when the unrolled
+    // body fits the budget. Past a few dozen iterations the pipeliner should
+    // see the loop, not a straight-line copy of it.
+    UP.FullUnrollMaxCount = std::max(32u, Cfg.Unroll.MaxUnrollFactor);
     UP.Partial = true;
     UP.Runtime = true;
     UP.AllowRemainder = true;
-    UP.AllowExpensiveTripCount = true;
     UP.UpperBound = true;
-    UP.UnrollRemainder = true;
+    UP.UnrollRemainder = false;
     UP.UnrollAndJam = Cfg.Unroll.PreferUnrollAndJam;
-    UP.UnrollVectorizedLoop = true;
-    UP.RuntimeUnrollMultiExit = true;
-    UP.AddAdditionalAccumulators = true;
-    UP.UnrollAndJamInnerLoopThreshold =
-        std::max(UP.UnrollAndJamInnerLoopThreshold,
-                 Cfg.Unroll.UnrollAndJamInnerLoopThreshold);
-    UP.SCEVExpansionBudget =
-        std::max(UP.SCEVExpansionBudget, Cfg.Unroll.SCEVExpansionBudget);
-
-    if (Cfg.Unroll.ForceUnroll && EnableAggressiveConstUnroll) {
-      const unsigned SafeTripCount =
-          ConstTripCount > std::numeric_limits<unsigned>::max()
-              ? std::numeric_limits<unsigned>::max()
-              : static_cast<unsigned>(ConstTripCount);
-      UP.Force = true;
-      UP.Count = std::max(
-          1u, std::min<unsigned>(Cfg.Unroll.DefaultUnrollFactor, SafeTripCount));
-    }
+    UP.AddAdditionalAccumulators = false;
+    UP.Force = Cfg.Unroll.ForceUnroll && UF > 1;
+    UP.UnrollAndJamInnerLoopThreshold = Cfg.Unroll.UnrollAndJamInnerLoopThreshold;
+    UP.SCEVExpansionBudget = Cfg.Unroll.SCEVExpansionBudget;
+    (void)SE;
+    (void)ORE;
     return;
   }
 

@@ -1,6 +1,7 @@
 #include "StarbugVLIWConfig.h"
 
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/bit.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
@@ -14,19 +15,24 @@ static cl::opt<unsigned> StarbugVLanes(
     cl::desc("Override Starbug VLIW lane count"));
 
 static cl::opt<bool> StarbugVForceUnroll(
-    "starbug-vliw-force-unroll", cl::init(true), cl::Hidden,
-    cl::desc("Force aggressive loop unrolling for Starbug VLIW"));
+    "starbug-vliw-force-unroll", cl::init(false), cl::Hidden,
+    cl::desc("Force the Starbug unroll factor even when the heuristic "
+             "would not unroll"));
 
-// Eight live results already press the 32 integer registers, and a spill is
-// another memory operation. The unroll factor stays at 8.
-// Sweep with -starbug-vliw-unroll-factor to reproduce.
+// 0 asks the TTI to derive the factor from the recurrence, the issue width
+// and the register file. A positive value is used as the starting factor and
+// then clipped by the spill and I-cache guards.
 static cl::opt<unsigned> StarbugVUnrollFactor(
-    "starbug-vliw-unroll-factor", cl::init(8), cl::Hidden,
-    cl::desc("Preferred loop unroll factor for Starbug VLIW"));
+    "starbug-vliw-unroll-factor", cl::init(0), cl::Hidden,
+    cl::desc("Starbug unroll factor; 0 derives it from the machine"));
 
 static cl::opt<unsigned> StarbugVMaxUnroll(
-    "starbug-vliw-max-unroll", cl::init(16), cl::Hidden,
-    cl::desc("Maximum unroll factor allowed for Starbug VLIW"));
+    "starbug-vliw-max-unroll", cl::init(8), cl::Hidden,
+    cl::desc("Maximum Starbug unroll factor (one copy per lane by default)"));
+
+static cl::opt<bool> StarbugVSpillGuard(
+    "starbug-vliw-spill-pressure-guard", cl::init(true), cl::Hidden,
+    cl::desc("Shrink the Starbug unroll factor when copies would spill"));
 
 static cl::opt<unsigned> StarbugVUnrollThreshold(
     "starbug-vliw-unroll-threshold", cl::init(400), cl::Hidden,
@@ -273,15 +279,18 @@ StarbugVLIWConfig StarbugVLIWConfig::getDefault() {
   for (unsigned Lane = 1; Lane < Cfg.NumLanes; ++Lane)
     Cfg.Lanes.push_back(makeALULane(Lane));
 
-  Cfg.Unroll.ForceUnroll = true;
-  Cfg.Unroll.DefaultUnrollFactor = 8;
-  Cfg.Unroll.MaxUnrollFactor = 16;
-  Cfg.Unroll.Threshold = 400;
-  Cfg.Unroll.PartialThreshold = 300;
-  Cfg.Unroll.MaxPercentThresholdBoost = 400;
-  Cfg.Unroll.UnrollAndJamInnerLoopThreshold = 200;
-  Cfg.Unroll.SCEVExpansionBudget = 4096;
-  Cfg.Unroll.PreferUnrollAndJam = true;
+  Cfg.Unroll.ForceUnroll = false;
+  Cfg.Unroll.DefaultUnrollFactor = 0;
+  Cfg.Unroll.MaxUnrollFactor = 8;
+  Cfg.Unroll.ICacheBudget = 64;
+  Cfg.Unroll.IntRegBudget = 18;
+  Cfg.Unroll.FPRegBudget = 18;
+  Cfg.Unroll.Threshold = 64;
+  Cfg.Unroll.PartialThreshold = 64;
+  Cfg.Unroll.MaxPercentThresholdBoost = 100;
+  Cfg.Unroll.UnrollAndJamInnerLoopThreshold = 60;
+  Cfg.Unroll.SCEVExpansionBudget = 256;
+  Cfg.Unroll.PreferUnrollAndJam = false;
   Cfg.Unroll.SpillPressureGuard = true;
 
   Cfg.Scheduler.PrioritizePointerBumps = true;
@@ -308,8 +317,8 @@ StarbugVLIWConfig StarbugVLIWConfig::fromCommandLine() {
   Cfg.NumLanes = std::max(1u, StarbugVLanes.getValue());
   Cfg.Bank1Skew = StarbugVBank1Skew.getValue();
   Cfg.Unroll.ForceUnroll = StarbugVForceUnroll;
-  Cfg.Unroll.DefaultUnrollFactor = StarbugVUnrollFactor;
-  Cfg.Unroll.MaxUnrollFactor = StarbugVMaxUnroll;
+  Cfg.Unroll.DefaultUnrollFactor = std::min(512u, StarbugVUnrollFactor.getValue());
+  Cfg.Unroll.MaxUnrollFactor = std::min(512u, StarbugVMaxUnroll.getValue());
   Cfg.Unroll.Threshold = StarbugVUnrollThreshold;
   Cfg.Unroll.PartialThreshold = StarbugVPartialUnrollThreshold;
   Cfg.Unroll.MaxPercentThresholdBoost =
@@ -318,10 +327,15 @@ StarbugVLIWConfig StarbugVLIWConfig::fromCommandLine() {
       StarbugVUnrollAndJamInnerThreshold;
   Cfg.Unroll.SCEVExpansionBudget =
       std::max(1u, StarbugVSCEVExpansionBudget.getValue());
-  if (Cfg.Unroll.DefaultUnrollFactor == 0)
-    Cfg.Unroll.DefaultUnrollFactor = 1;
-  Cfg.Unroll.MaxUnrollFactor =
-      std::max(Cfg.Unroll.MaxUnrollFactor, Cfg.Unroll.DefaultUnrollFactor);
+  Cfg.Unroll.SpillPressureGuard = StarbugVSpillGuard;
+  if (Cfg.Unroll.MaxUnrollFactor == 0)
+    Cfg.Unroll.MaxUnrollFactor = 1;
+  // An explicit factor is allowed to raise the ceiling so
+  // -starbug-vliw-unroll-factor=N is enough for a sweep. The spill guard
+  // still shrinks N when the copies would not fit.
+  if (Cfg.Unroll.DefaultUnrollFactor)
+    Cfg.Unroll.MaxUnrollFactor = std::max(Cfg.Unroll.MaxUnrollFactor,
+                                         Cfg.Unroll.DefaultUnrollFactor);
   Cfg.Scheduler.PacketizerLookAhead = std::max(1u, StarbugVPacketizerLookAhead.getValue());
   Cfg.Scheduler.DependencyLookback = std::max(1u, StarbugVDependencyLookback.getValue());
   Cfg.Scheduler.ReserveLane0ForAny = StarbugVReserveLane0;
@@ -348,6 +362,54 @@ StarbugVLIWConfig StarbugVLIWConfig::fromCommandLine() {
   }
 
   return Cfg;
+}
+
+static unsigned floorPow2(unsigned N) {
+  if (N <= 1)
+    return 1;
+  return 1u << (31 - llvm::countl_zero(N));
+}
+
+unsigned RISCVVLIW::computePipelineUnrollFactor(
+    const PipelineUnrollShape &Shape, const PipelineUnrollBudget &Budget) {
+  unsigned UF = 1;
+  if (Budget.ExplicitFactor) {
+    UF = Budget.ExplicitFactor;
+  } else if (!Shape.PipelinerCandidate) {
+    // No modulo schedule will overlap iterations. Unroll until one copy of
+    // the body can fill the issue width, and no further.
+    const unsigned Indep = std::max(1u, Shape.IndependentInsts);
+    UF = std::max(1u, (Budget.IssueWidth + Indep - 1) / Indep);
+    UF = floorPow2(UF);
+  } else {
+    // The pipeliner hides a carried chain by overlapping the next iteration.
+    // Extra copies only help when the chain is longer than the independent
+    // work already in the body; they do not create ILP on their own.
+    // Accumulator splitting is what breaks a reduction into independent chains.
+    const unsigned Indep = Shape.IndependentInsts;
+    if (Indep == 0)
+      UF = std::max(1u, Shape.CarriedLat);
+    else
+      UF = std::max(1u, (Shape.CarriedLat + Indep - 1) / Indep);
+    UF = floorPow2(UF);
+  }
+
+  UF = std::min(UF, std::max(1u, Budget.HardMax));
+  if (!Budget.SpillGuard)
+    return std::max(1u, UF);
+
+  auto fits = [&](unsigned Factor) {
+    if (Shape.LiveInt && Factor * Shape.LiveInt > Budget.IntBudget)
+      return false;
+    if (Shape.LiveFP && Factor * Shape.LiveFP > Budget.FPBudget)
+      return false;
+    if (Shape.BodyInsts && Factor * Shape.BodyInsts > Budget.ICacheInsts)
+      return false;
+    return true;
+  };
+  while (UF > 1 && !fits(UF))
+    UF >>= 1;
+  return std::max(1u, UF);
 }
 
 bool StarbugVLIWConfig::isLaneLegal(unsigned Lane, OpClass Class) const {
